@@ -124,7 +124,7 @@ class Upstreams:
                 {"index": 0, "active": True, "url": "https://www.google.com/search?q=x", "title": "Google",
                  "tab_id": "t-aaaaaaaaaaaa", "owner": None},
                 {"index": 1, "active": False, "url": "https://business.facebook.com/x", "title": "<b>Meta</b>",
-                 "tab_id": "t-bbbbbbbbbbbb", "owner": "emad"},
+                 "tab_id": "t-bbbbbbbbbbbb", "owner": "emad", "last_action_at": 1700000000.5},
                 {"index": 2, "active": False, "url": "about:blank", "title": "",
                  "tab_id": "t-cccccccccccc", "owner": "helper"},
                 {"index": "bad"},
@@ -709,7 +709,9 @@ def test_browser_page_stops_offering_a_dead_viewer_link_after_a_broker_restart(t
         assert "Browser: open" in dead_page.text
         assert "/vnc/vnc.html" not in dead_page.text
         assert "/api/browser/type" not in dead_page.text
-        assert "tab-strip" not in dead_page.text
+        # The strip itself stays -- it now honestly reports the stale session via
+        # data-viewable instead of disappearing (see the strip test's own comment).
+        assert "id=tab-strip" in dead_page.text and "data-viewable='0'" in dead_page.text
         assert "دوس Open تحت" in dead_page.text
         # The recovery path is the same "Open" form the page already renders,
         # and it must still be there for the owner to press.
@@ -1052,23 +1054,36 @@ def test_tab_strip_lists_who_works_where_and_shows_a_tab_on_the_owners_tap(tmp_p
         closed = client.get("/api/browser/tabs")
         assert closed.status_code == 403
         page = client.get("/browser")
-        assert "tab-strip" not in page.text, "no strip while the browser is closed"
+        # The strip stays on the page even while the browser is closed (owner complaint,
+        # 2026-09-29: it used to vanish outright, so he saw no status at all) -- it just
+        # says so, via data-viewable, instead of polling into a wall of 403s silently.
+        assert "id=tab-strip" in page.text and "data-viewable='0'" in page.text
 
         assert client.post("/api/browser/open", headers=mutate(csrf), json={"totp_code": "333333"}).status_code == 200
         page = client.get("/browser")
         assert "id=tab-strip" in page.text and "<script src=/browser/tabs.js></script>" in page.text
+        assert "data-viewable='1'" in page.text
+        # The "watching now" bar and the auto-follow toggle the owner asked for.
+        assert "id=tab-strip-watching" in page.text
+        assert "id=tab-strip-autofollow" in page.text and "تابع الموظف تلقائي" in page.text
         assert "script-src 'self'" in page.headers["content-security-policy"]
         script = client.get("/browser/tabs.js")
         assert script.status_code == 200 and script.headers["content-type"].startswith("text/javascript")
         assert "innerHTML" not in script.text
+        # Auto-follow logic: throttled and keyed off last_action_at, never off just index.
+        assert "autoFollowEnabled" in script.text and "last_action_at" in script.text
+        assert "MANUAL_COOLDOWN_MS" in script.text and "MIN_GAP_MS" in script.text
+        assert "localStorage" in script.text
 
         tabs = client.get("/api/browser/tabs")
         assert tabs.status_code == 200
         assert tabs.json() == {"tabs": [
-            {"index": 0, "active": True, "owner": None, "owner_label": "أنت", "title": "Google", "host": "www.google.com"},
+            {"index": 0, "active": True, "owner": None, "owner_label": "أنت", "title": "Google",
+             "host": "www.google.com", "tab_id": "t-aaaaaaaaaaaa", "last_action_at": None},
             {"index": 1, "active": False, "owner": "emad", "owner_label": "عماد", "title": "<b>Meta</b>",
-             "host": "business.facebook.com"},
-            {"index": 2, "active": False, "owner": "helper", "owner_label": "helper", "title": "", "host": ""},
+             "host": "business.facebook.com", "tab_id": "t-bbbbbbbbbbbb", "last_action_at": 1700000000.5},
+            {"index": 2, "active": False, "owner": "helper", "owner_label": "helper", "title": "", "host": "",
+             "tab_id": "t-cccccccccccc", "last_action_at": None},
         ]}
 
         # Showing a tab is a same-origin, CSRF-checked mutation.

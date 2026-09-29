@@ -82,34 +82,99 @@ BROWSER_PAGE_CONTENT_SECURITY_POLICY = (
 # Who opened each tab, as the owner reads it. Unknown labels are shown as-is.
 TAB_OWNER_NAMES_AR = {"emad": "عماد", "ziad": "زياد", "nihad": "نهاد"}
 TAB_OWNER_SELF_AR = "أنت"
-TAB_STRIP_SCRIPT = """(function () {
+# Auto-follow throttle constants (ms), shared between the comment below and the code so the
+# two never drift apart.
+_AUTO_FOLLOW_MANUAL_COOLDOWN_MS = 20000  # never within 20s of the owner manually choosing a tab
+_AUTO_FOLLOW_MIN_GAP_MS = 5000  # never switch more often than every 5s
+
+TAB_STRIP_SCRIPT = ("""(function () {
   var box = document.getElementById('tab-strip');
   if (!box) { return; }
   var csrf = box.getAttribute('data-csrf') || '';
-  var list = box.querySelector('ol');
-  var note = box.querySelector('p');
+  var storageKey = 'ab_auto_follow:' + (box.getAttribute('data-account') || '');
+  var list = document.getElementById('tab-strip-list');
+  var note = document.getElementById('tab-strip-note');
+  var watching = document.getElementById('tab-strip-watching');
+  var autoFollowBox = document.getElementById('tab-strip-autofollow');
+  var lastManualSwitchAt = 0;
+  var lastAutoFollowAt = 0;
+  var MANUAL_COOLDOWN_MS = """ + str(_AUTO_FOLLOW_MANUAL_COOLDOWN_MS) + """;
+  var MIN_GAP_MS = """ + str(_AUTO_FOLLOW_MIN_GAP_MS) + """;
+
+  function autoFollowEnabled() {
+    try { return window.localStorage.getItem(storageKey) === '1'; } catch (e) { return false; }
+  }
+  function setAutoFollow(on) {
+    try { window.localStorage.setItem(storageKey, on ? '1' : '0'); } catch (e) { /* ignore */ }
+  }
+  if (autoFollowBox) {
+    autoFollowBox.checked = autoFollowEnabled();
+    autoFollowBox.addEventListener('change', function () { setAutoFollow(autoFollowBox.checked); });
+  }
+
+  function ownerLine(tab) {
+    return '\u0628\u062A\u062A\u0641\u0631\u062C \u062F\u0644\u0648\u0642\u062A\u064A \u0639\u0644\u0649: '
+      + tab.owner_label + ' \u2014 ' + (tab.title || tab.host || '\u2026');
+  }
+
   function render(tabs) {
     list.textContent = '';
+    var active = null;
     tabs.forEach(function (tab) {
+      if (tab.active) { active = tab; }
       var item = document.createElement('li');
       var button = document.createElement('button');
       button.type = 'button';
       button.dir = 'auto';
+      button.className = 'tab-strip-btn' + (tab.active ? ' tab-strip-btn-active' : '');
       button.setAttribute('aria-pressed', tab.active ? 'true' : 'false');
-      button.style.fontWeight = tab.active ? 'bold' : 'normal';
       var shown = tab.active ? '\u25CF ' : '';
       button.textContent = shown + tab.owner_label + ' \u2014 ' + (tab.title || tab.host || '\u2026');
       button.title = tab.host || '';
-      button.addEventListener('click', function () { show(tab.index); });
+      button.addEventListener('click', function () {
+        lastManualSwitchAt = Date.now();
+        show(tab.index);
+      });
       item.appendChild(button);
       list.appendChild(item);
     });
+    watching.textContent = active ? ownerLine(active) : (
+      tabs.length ? '' : '\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u0628\u0648\u064A\u0628\u0627\u062A \u0645\u0641\u062A\u0648\u062D\u0629 \u062F\u0644\u0648\u0642\u062A\u064A.'
+    );
+    note.textContent = '';
   }
+
+  function maybeAutoFollow(tabs) {
+    if (!autoFollowEnabled()) { return; }
+    var now = Date.now();
+    if (now - lastManualSwitchAt < MANUAL_COOLDOWN_MS) { return; }
+    if (now - lastAutoFollowAt < MIN_GAP_MS) { return; }
+    var active = null;
+    var best = null;
+    tabs.forEach(function (tab) {
+      if (tab.active) { active = tab; }
+      if (typeof tab.last_action_at === 'number') {
+        if (!best || tab.last_action_at > best.last_action_at) { best = tab; }
+      }
+    });
+    if (!active || !best || best.tab_id === active.tab_id) { return; }
+    if (typeof active.last_action_at === 'number' && active.last_action_at >= best.last_action_at) { return; }
+    lastAutoFollowAt = now;
+    show(best.index);
+  }
+
   function poll() {
     fetch('/api/browser/tabs', {credentials: 'same-origin', headers: {'Accept': 'application/json'}})
       .then(function (r) { if (!r.ok) { throw new Error(String(r.status)); } return r.json(); })
-      .then(function (data) { render(data.tabs || []); note.textContent = ''; })
-      .catch(function () { note.textContent = '\u062A\u0639\u0630\u0651\u0631 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u062A\u0628\u0648\u064A\u0628\u0627\u062A'; });
+      .then(function (data) {
+        var tabs = data.tabs || [];
+        render(tabs);
+        maybeAutoFollow(tabs);
+      })
+      .catch(function () {
+        watching.textContent = '';
+        note.textContent = '\u0627\u0644\u062C\u0644\u0633\u0629 \u0642\u062F\u064A\u0645\u0629 \u0623\u0648 \u0645\u0642\u0641\u0648\u0644\u0629 \u062F\u0644\u0648\u0642\u062A\u064A \u2014 \u0627\u0641\u062A\u062D \u0627\u0644\u0645\u062A\u0635\u0641\u062D \u0645\u0646 \u062A\u062D\u062A.';
+      });
   }
   function show(index) {
     fetch('/api/browser/tabs/activate', {
@@ -118,10 +183,13 @@ TAB_STRIP_SCRIPT = """(function () {
       body: JSON.stringify({index: index})
     }).then(poll, poll);
   }
+  if (box.getAttribute('data-viewable') !== '1') {
+    note.textContent = '\u0627\u0644\u062C\u0644\u0633\u0629 \u0642\u062F\u064A\u0645\u0629 \u0623\u0648 \u0645\u0642\u0641\u0648\u0644\u0629 \u062F\u0644\u0648\u0642\u062A\u064A \u2014 \u0627\u0641\u062A\u062D \u0627\u0644\u0645\u062A\u0635\u0641\u062D \u0645\u0646 \u062A\u062D\u062A.';
+  }
   poll();
   setInterval(poll, 3000);
 })();
-"""
+""")
 
 SECURITY_HEADERS = {
     "Cache-Control": "no-store, max-age=0",
@@ -1100,21 +1168,44 @@ def create_app(
             "<button>ابعت (Send)</button></form>"
             if viewable else ""
         )
-        # Which tab each employee is working in, and which one the live view
-        # shows. Polled by /browser/tabs.js; a tap asks to show that tab.
+        # Which tab each employee is working in, and which one the live view shows right now.
+        # Polled by /browser/tabs.js; a tap (or auto-follow) asks to show that tab. Kept on the
+        # page even when the session looks stale/closed (data-viewable=0) so the owner always
+        # sees an honest status here instead of the section just vanishing (owner complaint,
+        # 2026-09-29: "لما أفتح البلكونة مش شايف الموظف بيعمل إيه").
         tab_strip = (
-            f"<section id=tab-strip data-csrf='{csrf}'>"
-            "<h2>التبويبات</h2><ol></ol><p></p></section>"
+            f"<section id=tab-strip data-csrf='{csrf}' data-account='{account}' "
+            f"data-viewable='{'1' if viewable else '0'}'>"
+            "<style>"
+            "#tab-strip{margin:0 0 1em;padding:.75em .9em;border:1px solid #bbb;border-radius:10px;"
+            "background:#fafafa}"
+            "#tab-strip-watching{font-weight:bold;font-size:1.15em;margin:0 0 .6em;min-height:1.4em}"
+            "#tab-strip-autofollow-label{display:flex;align-items:center;gap:.5em;margin:0 0 .75em;"
+            "font-size:1.05em}"
+            "#tab-strip-autofollow{width:1.3em;height:1.3em}"
+            "#tab-strip-list{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:.5em}"
+            "#tab-strip-list li{margin:0}"
+            ".tab-strip-btn{font-size:1.05em;line-height:1.3;padding:.7em 1.1em;border-radius:9px;"
+            "border:1px solid #999;background:#eee;min-height:44px;min-width:44px}"
+            ".tab-strip-btn-active{background:#2a6df4;color:#fff;border-color:#1c53c0}"
+            "#tab-strip-note{margin:.6em 0 0;color:#a33;font-weight:bold}"
+            "#tab-strip-note:empty{display:none}"
+            "</style>"
+            "<p id=tab-strip-watching dir=rtl></p>"
+            "<label id=tab-strip-autofollow-label dir=rtl>"
+            "<input type=checkbox id=tab-strip-autofollow> تابع الموظف تلقائي</label>"
+            "<ol id=tab-strip-list dir=rtl></ol>"
+            "<p id=tab-strip-note dir=rtl></p>"
+            "</section>"
             "<script src=/browser/tabs.js></script>"
-            if viewable else ""
         )
         return HTMLResponse(
             "<!doctype html><meta charset=utf-8><title>Secure Browser</title>"
             f"<h1>Secure Browser</h1><p>Signed in as {account}</p><p>Browser: {state}</p>"
             "<p><a href='/sites'>Manage allowed sites and assistant requests</a></p>"
             "<p><a href='/profiles'>احفظ الدخول (saved logins)</a></p>"
-            f"{viewer_link}"
             f"{tab_strip}"
+            f"{viewer_link}"
             f"{type_bridge}"
             "<h2>Open browser</h2><form method=post action=/api/browser/open>"
             f"<input type=hidden name=csrf_token value='{csrf}'>"
@@ -1629,6 +1720,12 @@ def create_app(
                 host = (urlsplit(url).hostname or "")[:253]
             except ValueError:
                 host = ""
+        tab_id = value.get("tab_id")
+        tab_id = tab_id if isinstance(tab_id, str) and re.fullmatch(r"t-[0-9a-f]{12}", tab_id) else None
+        last_action_at = value.get("last_action_at")
+        last_action_at = last_action_at if isinstance(last_action_at, (int, float)) and not isinstance(
+            last_action_at, bool
+        ) else None
         return {
             "index": index,
             "active": value.get("active") is True,
@@ -1636,6 +1733,10 @@ def create_app(
             "owner_label": TAB_OWNER_SELF_AR if owner is None else TAB_OWNER_NAMES_AR.get(owner, owner),
             "title": title[:120] if isinstance(title, str) else "",
             "host": host,
+            # Stable id (Balcony auto-follow matches on this across polls) and the last time a
+            # page-scoped call ran in this tab, both from the controller via the broker.
+            "tab_id": tab_id,
+            "last_action_at": last_action_at,
         }
 
     @app.get("/api/browser/tabs")
