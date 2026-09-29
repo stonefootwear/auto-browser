@@ -16,7 +16,7 @@ from ...navigation_policy import await_public_dns_check
 from ...network_inspector import NetworkInspector
 from ...utils import UTC
 from ..tab_scope import current_tab_id, detached_context
-from ..tab_view import TabView, page_for_tab, unwrap_session
+from ..tab_view import TabView, mark_tab_activity, page_for_tab, unwrap_session
 from .connection_health import (
     DRIVER_EXITED,
     is_driver_dead_error,
@@ -723,7 +723,11 @@ class BrowserSessionService:
         if tab_id is not None:
             # A tab-scoped request (X-Tab-Id): hand back that one tab. The
             # owner's active tab is not healed or touched from here.
-            return self.tab_view(session, tab_id)
+            view = self.tab_view(session, tab_id)
+            # Balcony auto-follow reads this to know which employee tab just
+            # did something; only a resolved, still-open tab counts.
+            mark_tab_activity(session, tab_id)
+            return view
         # The active tab may have closed on its own (an OAuth popup closing
         # after sign-in): go back to the tab that opened it before anyone acts.
         dialogs = getattr(self.manager, "dialogs", None)
