@@ -38,6 +38,7 @@ class Upstreams:
         self.broker_assertions: set[str] = set()
         self.active = False
         self.fail_active_binding = False
+        self.visual_access_error_status: int | None = None
         self.site_requests: list[dict] = []
         self.profile_calls: list[tuple] = []
         self.saved_profiles: set[str] = set()
@@ -94,6 +95,8 @@ class Upstreams:
             self.active = False
             return httpx.Response(200, json={"owner_credential": BROKER_TOKEN})
         if request.method == "GET" and request.url.path == "/owner/visual-access":
+            if self.visual_access_error_status is not None:
+                return httpx.Response(self.visual_access_error_status)
             if self.active:
                 return httpx.Response(200, json={"session_id": "browser-1"})
             return httpx.Response(403, json={"detail": "Owner must open a verified browser session first"})
@@ -124,7 +127,7 @@ class Upstreams:
                 {"index": 0, "active": True, "url": "https://www.google.com/search?q=x", "title": "Google",
                  "tab_id": "t-aaaaaaaaaaaa", "owner": None},
                 {"index": 1, "active": False, "url": "https://business.facebook.com/x", "title": "<b>Meta</b>",
-                 "tab_id": "t-bbbbbbbbbbbb", "owner": "emad"},
+                 "tab_id": "t-bbbbbbbbbbbb", "owner": "emad", "last_action_at": 1700000000.5},
                 {"index": 2, "active": False, "url": "about:blank", "title": "",
                  "tab_id": "t-cccccccccccc", "owner": "helper"},
                 {"index": "bad"},
@@ -736,7 +739,9 @@ def test_browser_page_stops_offering_a_dead_viewer_link_after_a_broker_restart(t
         assert "Browser: open" in dead_page.text
         assert "href='/viewer'" not in dead_page.text
         assert "/api/browser/type" not in dead_page.text
-        assert "tab-strip" not in dead_page.text
+        # The strip itself stays -- it now honestly reports the stale session via
+        # data-viewable instead of disappearing (see the strip test's own comment).
+        assert "id=tab-strip" in dead_page.text and "data-viewable='0'" in dead_page.text
         assert "دوس Open تحت" in dead_page.text
         # The recovery path is the same "Open" form the page already renders,
         # and it must still be there for the owner to press.
@@ -747,6 +752,39 @@ def test_browser_page_stops_offering_a_dead_viewer_link_after_a_broker_restart(t
         assert reopened.status_code == 200
         healed_page = client.get("/browser").text
         assert "href='/viewer'" in healed_page
+
+
+def test_viewer_distinguishes_terminal_close_from_temporary_broker_outage(tmp_path, clock, upstreams):
+    """A temporary outage keeps the authenticated shell but never opens VNC.
+
+    A confirmed dead owner session is terminal and sends the owner back to the
+    existing browser page, where opening still requires the normal human flow.
+    """
+    with TestClient(app_at(tmp_path, clock, upstreams), base_url=ORIGIN) as client:
+        csrf = login(client)
+        client.post("/api/browser/open", headers=mutate(csrf), json={})
+        assert client.get("/api/viewer/status").json() == {"status": "open"}
+
+        upstreams.visual_access_error_status = 503
+        temporary = client.get("/api/viewer/status")
+        assert temporary.status_code == 200
+        assert temporary.json() == {"status": "unavailable"}
+        assert client.get("/viewer").status_code == 200
+        assert client.get("/vnc/vnc_lite.html").status_code == 403
+
+        upstreams.visual_access_error_status = None
+        upstreams.active = False
+        terminal = client.get("/api/viewer/status")
+        assert terminal.status_code == 200
+        assert terminal.json() == {"status": "closed"}
+        redirected = client.get("/viewer", follow_redirects=False)
+        assert redirected.status_code == 303
+        assert redirected.headers["location"] == "/browser"
+
+
+def test_viewer_status_requires_the_signed_in_owner(tmp_path, clock, upstreams):
+    with TestClient(app_at(tmp_path, clock, upstreams), base_url=ORIGIN) as client:
+        assert client.get("/api/viewer/status").status_code == 401
 
 
 def test_all_responses_get_security_headers_and_mutations_require_origin(tmp_path, clock, upstreams):
@@ -1079,23 +1117,36 @@ def test_tab_strip_lists_who_works_where_and_shows_a_tab_on_the_owners_tap(tmp_p
         closed = client.get("/api/browser/tabs")
         assert closed.status_code == 403
         page = client.get("/browser")
-        assert "tab-strip" not in page.text, "no strip while the browser is closed"
+        # The strip stays on the page even while the browser is closed (owner complaint,
+        # 2026-09-29: it used to vanish outright, so he saw no status at all) -- it just
+        # says so, via data-viewable, instead of polling into a wall of 403s silently.
+        assert "id=tab-strip" in page.text and "data-viewable='0'" in page.text
 
         assert client.post("/api/browser/open", headers=mutate(csrf), json={"totp_code": "333333"}).status_code == 200
         page = client.get("/browser")
         assert "id=tab-strip" in page.text and "<script src=/browser/tabs.js></script>" in page.text
+        assert "data-viewable='1'" in page.text
+        # The "watching now" bar and the auto-follow toggle the owner asked for.
+        assert "id=tab-strip-watching" in page.text
+        assert "id=tab-strip-autofollow" in page.text and "تابع الموظف تلقائي" in page.text
         assert "script-src 'self'" in page.headers["content-security-policy"]
         script = client.get("/browser/tabs.js")
         assert script.status_code == 200 and script.headers["content-type"].startswith("text/javascript")
         assert "innerHTML" not in script.text
+        # Auto-follow logic: throttled and keyed off last_action_at, never off just index.
+        assert "autoFollowEnabled" in script.text and "last_action_at" in script.text
+        assert "MANUAL_COOLDOWN_MS" in script.text and "MIN_GAP_MS" in script.text
+        assert "localStorage" in script.text
 
         tabs = client.get("/api/browser/tabs")
         assert tabs.status_code == 200
         assert tabs.json() == {"tabs": [
-            {"index": 0, "active": True, "owner": None, "owner_label": "أنت", "title": "Google", "host": "www.google.com"},
+            {"index": 0, "active": True, "owner": None, "owner_label": "أنت", "title": "Google",
+             "host": "www.google.com", "tab_id": "t-aaaaaaaaaaaa", "last_action_at": None},
             {"index": 1, "active": False, "owner": "emad", "owner_label": "عماد", "title": "<b>Meta</b>",
-             "host": "business.facebook.com"},
-            {"index": 2, "active": False, "owner": "helper", "owner_label": "helper", "title": "", "host": ""},
+             "host": "business.facebook.com", "tab_id": "t-bbbbbbbbbbbb", "last_action_at": 1700000000.5},
+            {"index": 2, "active": False, "owner": "helper", "owner_label": "helper", "title": "", "host": "",
+             "tab_id": "t-cccccccccccc", "last_action_at": None},
         ]}
 
         # Showing a tab is a same-origin, CSRF-checked mutation.

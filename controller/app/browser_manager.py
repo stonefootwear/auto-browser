@@ -208,6 +208,16 @@ class BrowserSession:
     # controller's Playwright view of the page is wedged even though the
     # browser may be fine. The watchdog re-attaches the session in place.
     unresponsive_reason: str | None = None
+    # A renderer can crash while Page.is_closed() remains False. Keep those
+    # pages out of tab selection and a separate pending set for the bounded
+    # in-context recovery pass.
+    crashed_pages: "weakref.WeakKeyDictionary[Any, str]" = field(default_factory=weakref.WeakKeyDictionary)
+    pending_crashed_pages: "weakref.WeakSet[Any]" = field(default_factory=weakref.WeakSet)
+    renderer_recovery_attempts: "weakref.WeakKeyDictionary[Any, int]" = field(default_factory=weakref.WeakKeyDictionary)
+    renderer_retry_after: "weakref.WeakKeyDictionary[Any, float]" = field(default_factory=weakref.WeakKeyDictionary)
+    crash_listener_pages: "weakref.WeakSet[Any]" = field(default_factory=weakref.WeakSet)
+    renderer_recovery_count: int = 0
+    last_renderer_crash_reason: str | None = None
 
 
 SessionCreatedHook = Callable[[str, Page], Awaitable[None]]
@@ -677,6 +687,7 @@ class BrowserManager:
 
     def _attach_page_listeners(self, page: Page, session: BrowserSession) -> None:
         self.diagnostics.attach_page_listeners(page, session)
+        self.session_lifecycle.attach_page_crash_listener(page, session)
 
     async def handle_dialog(
         self, session_id: str, *, accept: bool, prompt_text: str | None = None

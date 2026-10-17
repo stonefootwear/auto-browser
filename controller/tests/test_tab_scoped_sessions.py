@@ -19,7 +19,14 @@ from app.action_errors import BrowserActionError
 from app.browser.services.dialogs import BrowserDialogService
 from app.browser.session_lock import SessionLock
 from app.browser.tab_scope import current_tab_id, detached_context, is_valid_tab_id
-from app.browser.tab_view import TabView, bind_tab, page_for_tab, tab_id_for, unwrap_session
+from app.browser.tab_view import (
+    TabView,
+    bind_tab,
+    page_for_tab,
+    tab_id_for,
+    tab_last_action_at,
+    unwrap_session,
+)
 from app.browser_manager import BrowserManager, BrowserSession
 from app.config import Settings
 from app.middleware.tab_scope import TabScopeMiddleware, is_tab_scoped_path
@@ -305,11 +312,32 @@ class TabIdentityTests(_ManagerCase):
         await self.manager.close_tab("s1", 1)
         self.assertNotIn(opened["tab_id"], self.session.tab_owners)
 
+    async def test_summaries_carry_last_action_at_and_closing_forgets_it(self) -> None:
+        opened = await self.open("emad")
+        tabs = await self.manager.list_tabs("s1")
+        self.assertIn("last_action_at", tabs[0])
+        # Nothing has run in the new tab yet.
+        self.assertIsNone(next(t for t in tabs if t["tab_id"] == opened["tab_id"])["last_action_at"])
+
+        await self.view(opened["tab_id"])  # a page-scoped call in Emad's tab
+
+        tabs = await self.manager.list_tabs("s1")
+        emad_tab = next(t for t in tabs if t["tab_id"] == opened["tab_id"])
+        self.assertIsInstance(emad_tab["last_action_at"], float)
+
+        await self.manager.close_tab("s1", 1)
+        self.assertIsNone(tab_last_action_at(self.session, opened["tab_id"]))
+
 
 # --- TabView + get_session -------------------------------------------------------------------
 
 
 class TabViewTests(_ManagerCase):
+    async def test_owner_untagged_calls_never_record_tab_activity(self) -> None:
+        opened = await self.open("emad")
+        await self.manager.get_session("s1")  # no X-Tab-Id: the owner's own call
+        self.assertIsNone(tab_last_action_at(self.session, opened["tab_id"]))
+
     async def test_get_session_resolves_the_tab_and_410s_when_gone(self) -> None:
         opened = await self.open("emad")
         view = await self.view(opened["tab_id"])

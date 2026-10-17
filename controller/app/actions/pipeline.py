@@ -161,6 +161,24 @@ class BrowserActionPipeline:
             await self._handle_browser_action_error(context, witness_state, exc)
             raise
         except PlaywrightError as exc:
+            # Local import avoids app.actions <-> browser.services package
+            # initialization cycling while BrowserManager is imported.
+            from ..browser.services.connection_health import is_renderer_crash_error
+
+            if is_renderer_crash_error(exc):
+                reason = str(exc) or "renderer process crashed"
+                lifecycle = getattr(context.manager, "session_lifecycle", None)
+                if lifecycle is not None:
+                    lifecycle.note_page_crash(context.session, context.session.page, source=reason)
+                raise BrowserActionError(
+                    "The current browser tab crashed and is being restored. Retry in a few seconds.",
+                    code="renderer_crashed",
+                    action=context.action_name,
+                    status_code=503,
+                    retryable=True,
+                    url=getattr(context.session.page, "url", None),
+                    details={"reason": reason},
+                ) from exc
             failed = await self._handle_playwright_error(context, witness_state)
             code, message = classify_playwright_error(str(exc))
             details: dict[str, Any] = {"snapshot": failed}

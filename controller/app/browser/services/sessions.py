@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -16,10 +17,11 @@ from ...navigation_policy import await_public_dns_check
 from ...network_inspector import NetworkInspector
 from ...utils import UTC
 from ..tab_scope import current_tab_id, detached_context
-from ..tab_view import TabView, page_for_tab, unwrap_session
+from ..tab_view import TabView, mark_tab_activity, page_for_tab, unwrap_session
 from .connection_health import (
     DRIVER_EXITED,
     is_driver_dead_error,
+    is_renderer_crash_error,
     playwright_driver_alive,
     session_connection_problem,
 )
@@ -32,6 +34,9 @@ if TYPE_CHECKING:
     from ...session_isolation import IsolatedBrowserRuntime
 
 logger = logging.getLogger(__name__)
+
+RENDERER_RECOVERY_MAX_ATTEMPTS = 3
+REATTACH_NEW_PAGE_TIMEOUT_SECONDS = 10
 
 
 class BrowserSessionService:
@@ -723,7 +728,11 @@ class BrowserSessionService:
         if tab_id is not None:
             # A tab-scoped request (X-Tab-Id): hand back that one tab. The
             # owner's active tab is not healed or touched from here.
-            return self.tab_view(session, tab_id)
+            view = self.tab_view(session, tab_id)
+            # Balcony auto-follow reads this to know which employee tab just
+            # did something; only a resolved, still-open tab counts.
+            mark_tab_activity(session, tab_id)
+            return view
         # The active tab may have closed on its own (an OAuth popup closing
         # after sign-in): go back to the tab that opened it before anyone acts.
         dialogs = getattr(self.manager, "dialogs", None)
@@ -977,6 +986,51 @@ class BrowserSessionService:
                 retryable=True,
                 url=getattr(session.page, "url", None),
             ) from None
+        except Exception as exc:
+            if not is_renderer_crash_error(exc):
+                raise
+            reason = str(exc) or "renderer process crashed"
+            self.note_page_crash(session, session.page, source=reason)
+            raise BrowserActionError(
+                "The current browser tab crashed and is being restored. Retry in a few seconds.",
+                code="renderer_crashed",
+                action=what,
+                status_code=503,
+                retryable=True,
+                url=getattr(session.page, "url", None),
+                details={"reason": reason},
+            ) from exc
+
+    def attach_page_crash_listener(self, page: Any, session: "BrowserSession") -> None:
+        """Listen for renderer crashes that do not close their Page handle."""
+        if not hasattr(page, "on") or page in session.crash_listener_pages:
+            return
+        session.crash_listener_pages.add(page)
+        page.on(
+            "crash",
+            lambda *_args: self.note_page_crash(
+                session, page, source="Playwright page crash event"
+            ),
+        )
+
+    def note_page_crash(self, session: "BrowserSession", page: Any, *, source: str) -> bool:
+        """Mark one renderer unusable and schedule a bounded recovery pass.
+
+        The identity check is the revocation boundary: a late event from a
+        closed or replaced session cannot open a page or put it back in the
+        live-session map.
+        """
+        session = unwrap_session(session)
+        if self.manager.sessions.get(session.id) is not session:
+            return False
+        already_pending = page in session.pending_crashed_pages
+        session.crashed_pages[page] = source
+        session.pending_crashed_pages.add(page)
+        session.last_renderer_crash_reason = source
+        logger.error("session %s: renderer crashed (%s)", session.id, source)
+        if not already_pending:
+            self.schedule_reap()
+        return True
 
     def schedule_reap(self) -> None:
         """Run a recovery pass soon, without the caller waiting for it."""
@@ -995,8 +1049,10 @@ class BrowserSessionService:
         """
         manager = self.manager
         driver_dead = not playwright_driver_alive(getattr(manager, "playwright", None))
+        sessions = list(manager.sessions.values())
         if not driver_dead and not any(
-            session_connection_problem(manager, session) for session in list(manager.sessions.values())
+            session_connection_problem(manager, session) or session.pending_crashed_pages
+            for session in sessions
         ):
             return
         task = getattr(manager, "_reap_task", None)
@@ -1022,6 +1078,166 @@ class BrowserSessionService:
                 await self.recover_dead_session(session, reason=problem)
             except Exception as exc:  # pragma: no cover - one session must not block the rest
                 logger.warning("recovering session %s failed: %s", session.id, exc)
+        # Renderer recovery is separate from link recovery: it keeps the
+        # browser process, context, cookies and unaffected tabs.
+        for session in list(manager.sessions.values()):
+            for page in list(session.pending_crashed_pages):
+                try:
+                    await self.recover_crashed_page(
+                        session,
+                        page,
+                        reason=session.crashed_pages.get(page, "renderer process crashed"),
+                    )
+                except Exception as exc:  # pragma: no cover - watchdog retries pending pages
+                    await self._record_renderer_recovery_failure(session, page, exc)
+
+    async def _record_renderer_recovery_failure(
+        self, session: "BrowserSession", page: Any, exc: Exception
+    ) -> None:
+        """Back off a failed renderer repair, then retire after a hard bound."""
+        async with session.lock:
+            if (
+                self.manager.sessions.get(session.id) is not session
+                or page not in session.pending_crashed_pages
+            ):
+                return
+            if session_connection_problem(self.manager, session) is not None:
+                return  # the link-recovery path owns the next watchdog pass
+            attempts = session.renderer_recovery_attempts.get(page, 0) + 1
+            session.renderer_recovery_attempts[page] = attempts
+            if attempts >= RENDERER_RECOVERY_MAX_ATTEMPTS:
+                reason = session.crashed_pages.get(page, "renderer process crashed")
+                logger.error(
+                    "session %s: renderer recovery failed %d times (%s); retiring session",
+                    session.id,
+                    attempts,
+                    exc,
+                )
+                async with self.teardown_lock(session):
+                    await self._retire_dead_session(
+                        session,
+                        reason=f"renderer recovery exhausted after {attempts} attempts ({reason})",
+                        keep_profile_open=True,
+                    )
+                return
+            delay = min(2 ** (attempts - 1), 10)
+            session.renderer_retry_after[page] = time.monotonic() + delay
+            logger.warning(
+                "session %s: renderer recovery attempt %d/%d failed; retrying after %ds: %s",
+                session.id,
+                attempts,
+                RENDERER_RECOVERY_MAX_ATTEMPTS,
+                delay,
+                exc,
+            )
+            self._schedule_renderer_retry(session, page, delay)
+
+    def _schedule_renderer_retry(self, session: "BrowserSession", page: Any, delay: float) -> None:
+        """Wake recovery after backoff even when the periodic watchdog is disabled."""
+        tasks = self.manager.__dict__.setdefault("_background_reaps", set())
+
+        async def retry() -> None:
+            await asyncio.sleep(delay)
+            if (
+                self.manager.sessions.get(session.id) is session
+                and page in session.pending_crashed_pages
+            ):
+                await self.reap_dead_sessions()
+
+        task = asyncio.create_task(retry(), context=detached_context())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def recover_crashed_page(self, session: "BrowserSession", page: Any, *, reason: str) -> bool:
+        """Replace or bypass one crashed renderer inside its existing context."""
+        manager = self.manager
+        async with session.lock:
+            if manager.sessions.get(session.id) is not session:
+                return False
+            if page not in session.pending_crashed_pages:
+                return True
+            if session.renderer_retry_after.get(page, 0.0) > time.monotonic():
+                return False
+            if session_connection_problem(manager, session) is not None:
+                return False  # link recovery owns this pass
+
+            raw_pages = _context_pages(session.context)
+            healthy = [
+                candidate
+                for candidate in raw_pages
+                if candidate is not page
+                and candidate not in session.crashed_pages
+                and not _page_is_closed(candidate)
+            ]
+            active = session.page is page
+            replacement = healthy[-1] if active and healthy else None
+            created_replacement = False
+
+            if active and replacement is None:
+                # If the crashed target vanished while recovery waited, the
+                # owner may have closed the last window. Never create a window
+                # after that explicit close.
+                if page not in raw_pages or _page_is_closed(page):
+                    async with self.teardown_lock(session):
+                        await self._retire_dead_session(
+                            session,
+                            reason="its crashed page closed and no other tabs remain",
+                        )
+                    return False
+                replacement = await asyncio.wait_for(session.context.new_page(), timeout=10)
+                replacement.set_default_timeout(manager.settings.action_timeout_ms)
+                created_replacement = True
+                manager._attach_page_listeners(replacement, session)
+
+            if active and replacement is not None:
+                if created_replacement:
+                    _transfer_tab_identity(session, page, replacement)
+                session.page = replacement
+                manager._attach_page_listeners(replacement, session)
+                bring_to_front = getattr(replacement, "bring_to_front", None)
+                if callable(bring_to_front):
+                    await asyncio.wait_for(bring_to_front(), timeout=5)
+
+            # Best effort only: the failed renderer remains excluded from tab
+            # APIs even if Chromium refuses the close command.
+            close = getattr(page, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(close(run_before_unload=False), timeout=2)
+            session.pending_crashed_pages.discard(page)
+            session.renderer_recovery_attempts.pop(page, None)
+            session.renderer_retry_after.pop(page, None)
+            session.renderer_recovery_count += 1
+            logger.warning(
+                "session %s: recovered renderer crash in-place (%s; active=%s; replacement=%s)",
+                session.id,
+                reason,
+                active,
+                "new page" if created_replacement else ("existing tab" if replacement else "none"),
+            )
+            try:
+                await manager.audit.append(
+                    event_type="renderer_crash_recovered",
+                    status="ok",
+                    action="recover_crashed_page",
+                    session_id=session.id,
+                    details={
+                        "reason": reason,
+                        "active": active,
+                        "replacement": (
+                            "new_page" if created_replacement else "existing_tab" if replacement else "none"
+                        ),
+                        "recovery_count": session.renderer_recovery_count,
+                    },
+                )
+            except Exception as exc:  # pragma: no cover - audit is best effort
+                logger.warning("audit append failed after renderer recovery: %s", exc)
+            if manager.sessions.get(session.id) is session:
+                try:
+                    await self.persist(session, status="active")
+                except Exception as exc:  # pragma: no cover - persistence is best effort
+                    logger.warning("persisting renderer recovery for session %s failed: %s", session.id, exc)
+            return True
 
     async def recover_dead_session(self, session: "BrowserSession", *, reason: str) -> bool:
         """Re-attach a persistent-profile session in place, else retire it.
@@ -1084,6 +1300,13 @@ class BrowserSessionService:
         if manager.playwright is None:
             raise RuntimeError("Playwright not started")
         old_browser = session.browser
+        old_pages = _context_pages(session.context)
+        crashed_descriptors = [
+            (_page_url(page), session.crashed_pages.get(page, "renderer process crashed"))
+            for page in old_pages
+            if page in session.crashed_pages
+        ]
+        old_active_url = _page_url(session.page)
         if old_browser is not None:
             try:
                 await asyncio.wait_for(old_browser.close(), timeout=5)
@@ -1105,7 +1328,41 @@ class BrowserSessionService:
         try:
             attachment = await manager.runtime.attach_persistent_context(handle)
             context = attachment.context
-            page = context.pages[-1] if context.pages else await context.new_page()
+            context_pages = _context_pages(context)
+            quarantined: dict[Any, str] = {}
+            mapping_uncertain = False
+            for url, crash_reason in crashed_descriptors:
+                matches = [candidate for candidate in context_pages if url and _page_url(candidate) == url]
+                if not matches:
+                    mapping_uncertain = True
+                    continue
+                # Duplicate URLs are ambiguous, so quarantine every match.
+                for candidate in matches:
+                    quarantined[candidate] = crash_reason
+            if mapping_uncertain:
+                # There is no stable Playwright target identity across driver
+                # connections. If URL matching cannot prove which target died,
+                # do not expose any old handle to another action.
+                fallback_reason = crashed_descriptors[0][1] if crashed_descriptors else "renderer process crashed"
+                quarantined = {candidate: fallback_reason for candidate in context_pages}
+            active_matches = [
+                candidate
+                for candidate in context_pages
+                if old_active_url and _page_url(candidate) == old_active_url
+            ]
+            active_candidate = active_matches[0] if len(active_matches) == 1 else None
+            healthy_pages = [candidate for candidate in context_pages if candidate not in quarantined]
+            if active_candidate in healthy_pages:
+                page = active_candidate
+            elif healthy_pages:
+                page = healthy_pages[-1]
+            else:
+                # If the only target is the crashed renderer, make a fresh tab
+                # in the same already-running profile. reattach_only above
+                # guarantees this never relaunches a browser the owner closed.
+                page = await asyncio.wait_for(
+                    context.new_page(), timeout=REATTACH_NEW_PAGE_TIMEOUT_SECONDS
+                )
             page.set_default_timeout(manager.settings.action_timeout_ms)
         except Exception:
             # browser-node now holds a lease for this generation: give it back
@@ -1122,6 +1379,13 @@ class BrowserSessionService:
         session.persistent_profile_generation = handle.generation
         session.driver_epoch = manager._driver_epoch
         session.unresponsive_reason = None
+        session.crashed_pages.clear()
+        session.pending_crashed_pages.clear()
+        session.renderer_recovery_attempts.clear()
+        session.renderer_retry_after.clear()
+        session.crash_listener_pages.clear()
+        for crashed_page, crash_reason in quarantined.items():
+            session.crashed_pages[crashed_page] = crash_reason
         session.reattach_count += 1
         manager._attach_page_listeners(page, session)
         for existing in _context_pages(context):
@@ -1480,3 +1744,32 @@ def _context_pages(context: Any) -> list[Any]:
         except Exception:
             return []
     return list(pages) if isinstance(pages, list) else []
+
+
+def _page_is_closed(page: Any) -> bool:
+    is_closed = getattr(page, "is_closed", None)
+    if callable(is_closed):
+        try:
+            return is_closed() is True
+        except Exception:
+            return True
+    return False
+
+
+def _page_url(page: Any) -> str:
+    value = getattr(page, "url", "")
+    return value if isinstance(value, str) else ""
+
+
+def _transfer_tab_identity(session: Any, old_page: Any, new_page: Any) -> None:
+    """Keep a tab-scoped grant bound to its replacement, never another tab."""
+    old_tab_id = session.tab_ids.pop(old_page, None)
+    if old_tab_id is None:
+        return
+    previous = session.tab_ids.pop(new_page, None)
+    if previous is not None and previous != old_tab_id:
+        session.tab_owners.pop(previous, None)
+    session.tab_ids[new_page] = old_tab_id
+    old_lock = session.page_locks.pop(old_page, None)
+    if old_lock is not None:
+        session.page_locks[new_page] = old_lock

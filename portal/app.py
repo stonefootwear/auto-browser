@@ -82,34 +82,99 @@ BROWSER_PAGE_CONTENT_SECURITY_POLICY = (
 # Who opened each tab, as the owner reads it. Unknown labels are shown as-is.
 TAB_OWNER_NAMES_AR = {"emad": "عماد", "ziad": "زياد", "nihad": "نهاد"}
 TAB_OWNER_SELF_AR = "أنت"
-TAB_STRIP_SCRIPT = """(function () {
+# Auto-follow throttle constants (ms), shared between the comment below and the code so the
+# two never drift apart.
+_AUTO_FOLLOW_MANUAL_COOLDOWN_MS = 20000  # never within 20s of the owner manually choosing a tab
+_AUTO_FOLLOW_MIN_GAP_MS = 5000  # never switch more often than every 5s
+
+TAB_STRIP_SCRIPT = ("""(function () {
   var box = document.getElementById('tab-strip');
   if (!box) { return; }
   var csrf = box.getAttribute('data-csrf') || '';
-  var list = box.querySelector('ol');
-  var note = box.querySelector('p');
+  var storageKey = 'ab_auto_follow:' + (box.getAttribute('data-account') || '');
+  var list = document.getElementById('tab-strip-list');
+  var note = document.getElementById('tab-strip-note');
+  var watching = document.getElementById('tab-strip-watching');
+  var autoFollowBox = document.getElementById('tab-strip-autofollow');
+  var lastManualSwitchAt = 0;
+  var lastAutoFollowAt = 0;
+  var MANUAL_COOLDOWN_MS = """ + str(_AUTO_FOLLOW_MANUAL_COOLDOWN_MS) + """;
+  var MIN_GAP_MS = """ + str(_AUTO_FOLLOW_MIN_GAP_MS) + """;
+
+  function autoFollowEnabled() {
+    try { return window.localStorage.getItem(storageKey) === '1'; } catch (e) { return false; }
+  }
+  function setAutoFollow(on) {
+    try { window.localStorage.setItem(storageKey, on ? '1' : '0'); } catch (e) { /* ignore */ }
+  }
+  if (autoFollowBox) {
+    autoFollowBox.checked = autoFollowEnabled();
+    autoFollowBox.addEventListener('change', function () { setAutoFollow(autoFollowBox.checked); });
+  }
+
+  function ownerLine(tab) {
+    return '\u0628\u062A\u062A\u0641\u0631\u062C \u062F\u0644\u0648\u0642\u062A\u064A \u0639\u0644\u0649: '
+      + tab.owner_label + ' \u2014 ' + (tab.title || tab.host || '\u2026');
+  }
+
   function render(tabs) {
     list.textContent = '';
+    var active = null;
     tabs.forEach(function (tab) {
+      if (tab.active) { active = tab; }
       var item = document.createElement('li');
       var button = document.createElement('button');
       button.type = 'button';
       button.dir = 'auto';
+      button.className = 'tab-strip-btn' + (tab.active ? ' tab-strip-btn-active' : '');
       button.setAttribute('aria-pressed', tab.active ? 'true' : 'false');
-      button.style.fontWeight = tab.active ? 'bold' : 'normal';
       var shown = tab.active ? '\u25CF ' : '';
       button.textContent = shown + tab.owner_label + ' \u2014 ' + (tab.title || tab.host || '\u2026');
       button.title = tab.host || '';
-      button.addEventListener('click', function () { show(tab.index); });
+      button.addEventListener('click', function () {
+        lastManualSwitchAt = Date.now();
+        show(tab.index);
+      });
       item.appendChild(button);
       list.appendChild(item);
     });
+    watching.textContent = active ? ownerLine(active) : (
+      tabs.length ? '' : '\u0644\u0627 \u062A\u0648\u062C\u062F \u062A\u0628\u0648\u064A\u0628\u0627\u062A \u0645\u0641\u062A\u0648\u062D\u0629 \u062F\u0644\u0648\u0642\u062A\u064A.'
+    );
+    note.textContent = '';
   }
+
+  function maybeAutoFollow(tabs) {
+    if (!autoFollowEnabled()) { return; }
+    var now = Date.now();
+    if (now - lastManualSwitchAt < MANUAL_COOLDOWN_MS) { return; }
+    if (now - lastAutoFollowAt < MIN_GAP_MS) { return; }
+    var active = null;
+    var best = null;
+    tabs.forEach(function (tab) {
+      if (tab.active) { active = tab; }
+      if (typeof tab.last_action_at === 'number') {
+        if (!best || tab.last_action_at > best.last_action_at) { best = tab; }
+      }
+    });
+    if (!active || !best || best.tab_id === active.tab_id) { return; }
+    if (typeof active.last_action_at === 'number' && active.last_action_at >= best.last_action_at) { return; }
+    lastAutoFollowAt = now;
+    show(best.index);
+  }
+
   function poll() {
     fetch('/api/browser/tabs', {credentials: 'same-origin', headers: {'Accept': 'application/json'}})
       .then(function (r) { if (!r.ok) { throw new Error(String(r.status)); } return r.json(); })
-      .then(function (data) { render(data.tabs || []); note.textContent = ''; })
-      .catch(function () { note.textContent = '\u062A\u0639\u0630\u0651\u0631 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u062A\u0628\u0648\u064A\u0628\u0627\u062A'; });
+      .then(function (data) {
+        var tabs = data.tabs || [];
+        render(tabs);
+        maybeAutoFollow(tabs);
+      })
+      .catch(function () {
+        watching.textContent = '';
+        note.textContent = '\u0627\u0644\u062C\u0644\u0633\u0629 \u0642\u062F\u064A\u0645\u0629 \u0623\u0648 \u0645\u0642\u0641\u0648\u0644\u0629 \u062F\u0644\u0648\u0642\u062A\u064A \u2014 \u0627\u0641\u062A\u062D \u0627\u0644\u0645\u062A\u0635\u0641\u062D \u0645\u0646 \u062A\u062D\u062A.';
+      });
   }
   function show(index) {
     fetch('/api/browser/tabs/activate', {
@@ -118,18 +183,29 @@ TAB_STRIP_SCRIPT = """(function () {
       body: JSON.stringify({index: index})
     }).then(poll, poll);
   }
+  if (box.getAttribute('data-viewable') !== '1') {
+    note.textContent = '\u0627\u0644\u062C\u0644\u0633\u0629 \u0642\u062F\u064A\u0645\u0629 \u0623\u0648 \u0645\u0642\u0641\u0648\u0644\u0629 \u062F\u0644\u0648\u0642\u062A\u064A \u2014 \u0627\u0641\u062A\u062D \u0627\u0644\u0645\u062A\u0635\u0641\u062D \u0645\u0646 \u062A\u062D\u062A.';
+  }
   poll();
   setInterval(poll, 3000);
 })();
-"""
+""")
 
 VIEWER_SCRIPT = r"""const frame = document.getElementById("remote-frame");
 const status = document.getElementById("status");
 const typingPanel = document.getElementById("typing-panel");
 const typingForm = document.getElementById("typing-form");
 const typingInput = document.getElementById("typing-input");
+const recoveryPanel = document.getElementById("viewer-recovery");
+const recoveryLink = document.getElementById("viewer-recovery-link");
 const csrf = document.body.dataset.csrf || "";
 let reconnectTimer = null;
+let connectWatchdogTimer = null;
+let reconnectAttempt = 0;
+let statusCheckInFlight = false;
+let reconnectStopped = false;
+const STATUS_TIMEOUT_MS = 8000;
+const CONNECT_TIMEOUT_MS = 10000;
 
 function remoteDocument() {
   try {
@@ -143,24 +219,91 @@ function remoteCanvas() {
   return remoteDocument()?.querySelector("#screen canvas") || null;
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer !== null) return;
-  status.textContent = "انقطع الاتصال — جاري إعادة الاتصال…";
+function scheduleReconnect(immediate = false) {
+  if (reconnectStopped || reconnectTimer !== null || statusCheckInFlight) return;
+  status.textContent = "\u0627\u0646\u0642\u0637\u0639 \u0627\u0644\u0627\u062a\u0635\u0627\u0644 \u2014 \u0633\u0646\u062d\u0627\u0648\u0644 \u0645\u0631\u0629 \u0623\u062e\u0631\u0649";
   status.dataset.state = "disconnected";
+  const delay = immediate ? 0 : Math.min(1500 * (2 ** reconnectAttempt), 15000);
+  if (!immediate) reconnectAttempt += 1;
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null;
-    connectViewer();
-  }, 1500);
+    checkViewerStatus();
+  }, delay);
+}
+
+function clearConnectWatchdog() {
+  if (connectWatchdogTimer !== null) window.clearTimeout(connectWatchdogTimer);
+  connectWatchdogTimer = null;
+}
+
+function stopReconnect(message, href, label) {
+  reconnectStopped = true;
+  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  clearConnectWatchdog();
+  frame.src = "about:blank";
+  status.textContent = message;
+  status.dataset.state = "closed";
+  recoveryLink.href = href;
+  recoveryLink.textContent = label;
+  recoveryPanel.hidden = false;
+}
+
+async function checkViewerStatus() {
+  if (reconnectStopped || statusCheckInFlight) return;
+  statusCheckInFlight = true;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
+  try {
+    const response = await fetch("/api/viewer/status", {
+      credentials: "same-origin",
+      headers: {"Accept": "application/json"},
+      signal: controller.signal,
+    });
+    if (response.status === 401 || response.status === 403) {
+      stopReconnect(
+        "\u0627\u0646\u062a\u0647\u062a \u062c\u0644\u0633\u0629 \u0627\u0644\u062f\u062e\u0648\u0644",
+        "/signin?next=%2Fviewer",
+        "\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u062f\u062e\u0648\u0644"
+      );
+      return;
+    }
+    if (!response.ok) throw new Error(String(response.status));
+    const data = await response.json();
+    if (data.status === "closed") {
+      stopReconnect(
+        "\u0627\u0644\u0645\u062a\u0635\u0641\u062d \u0645\u063a\u0644\u0642. \u0627\u0631\u062c\u0639 \u0648\u0627\u0641\u062a\u062d\u0647 \u0645\u0646 \u062c\u062f\u064a\u062f.",
+        "/browser",
+        "\u0641\u062a\u062d \u0635\u0641\u062d\u0629 \u0627\u0644\u0645\u062a\u0635\u0641\u062d"
+      );
+      return;
+    }
+    if (data.status === "open") {
+      connectViewer();
+      return;
+    }
+  } catch (_) {
+    // Keep the page steady during a temporary upstream outage. The next
+    // attempt checks status again before noVNC is reloaded.
+  } finally {
+    window.clearTimeout(timeout);
+    statusCheckInFlight = false;
+  }
+  scheduleReconnect();
 }
 
 function syncRemoteStatus(remoteStatus) {
+  if (reconnectStopped) return;
   const value = (remoteStatus?.textContent || "").trim().toLowerCase();
   if (value.startsWith("connected")) {
+    clearConnectWatchdog();
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     reconnectTimer = null;
-    status.textContent = "تم الاتصال";
+    reconnectAttempt = 0;
+    status.textContent = "\u062a\u0645 \u0627\u0644\u0627\u062a\u0635\u0627\u0644";
     status.dataset.state = "connected";
   } else if (value.includes("disconnected") || value.includes("wrong") || value.includes("closed")) {
+    clearConnectWatchdog();
     scheduleReconnect();
   } else {
     status.textContent = "جاري الاتصال…";
@@ -169,14 +312,17 @@ function syncRemoteStatus(remoteStatus) {
 }
 
 function prepareRemoteViewer() {
+  if (reconnectStopped) return;
   const doc = remoteDocument();
   if (!doc) {
+    clearConnectWatchdog();
     scheduleReconnect();
     return;
   }
   const remoteStatus = doc.getElementById("status");
   const remoteScreen = doc.getElementById("screen");
   if (!remoteStatus || !remoteScreen) {
+    clearConnectWatchdog();
     scheduleReconnect();
     return;
   }
@@ -209,6 +355,8 @@ function prepareRemoteViewer() {
 }
 
 function connectViewer() {
+  if (reconnectStopped) return;
+  clearConnectWatchdog();
   status.textContent = "جاري الاتصال…";
   status.dataset.state = "connecting";
   const url = new URL("/vnc/vnc_lite.html", window.location.href);
@@ -216,6 +364,10 @@ function connectViewer() {
   url.searchParams.set("scale", "true");
   url.searchParams.set("attempt", String(Date.now()));
   frame.src = url.href;
+  connectWatchdogTimer = window.setTimeout(() => {
+    connectWatchdogTimer = null;
+    scheduleReconnect();
+  }, CONNECT_TIMEOUT_MS);
 }
 
 function dispatchWheel(deltaX, deltaY, amplifiedEvents = null) {
@@ -279,7 +431,7 @@ document.getElementById("fullscreen").addEventListener("click", async () => {
   }
 });
 
-connectViewer();
+scheduleReconnect(true);
 """
 
 SECURITY_HEADERS = {
@@ -1266,21 +1418,44 @@ def create_app(
             "<button>ابعت (Send)</button></form>"
             if viewable else ""
         )
-        # Which tab each employee is working in, and which one the live view
-        # shows. Polled by /browser/tabs.js; a tap asks to show that tab.
+        # Which tab each employee is working in, and which one the live view shows right now.
+        # Polled by /browser/tabs.js; a tap (or auto-follow) asks to show that tab. Kept on the
+        # page even when the session looks stale/closed (data-viewable=0) so the owner always
+        # sees an honest status here instead of the section just vanishing (owner complaint,
+        # 2026-09-29: "لما أفتح البلكونة مش شايف الموظف بيعمل إيه").
         tab_strip = (
-            f"<section id=tab-strip data-csrf='{csrf}'>"
-            "<h2>التبويبات</h2><ol></ol><p></p></section>"
+            f"<section id=tab-strip data-csrf='{csrf}' data-account='{account}' "
+            f"data-viewable='{'1' if viewable else '0'}'>"
+            "<style>"
+            "#tab-strip{margin:0 0 1em;padding:.75em .9em;border:1px solid #bbb;border-radius:10px;"
+            "background:#fafafa}"
+            "#tab-strip-watching{font-weight:bold;font-size:1.15em;margin:0 0 .6em;min-height:1.4em}"
+            "#tab-strip-autofollow-label{display:flex;align-items:center;gap:.5em;margin:0 0 .75em;"
+            "font-size:1.05em}"
+            "#tab-strip-autofollow{width:1.3em;height:1.3em}"
+            "#tab-strip-list{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:.5em}"
+            "#tab-strip-list li{margin:0}"
+            ".tab-strip-btn{font-size:1.05em;line-height:1.3;padding:.7em 1.1em;border-radius:9px;"
+            "border:1px solid #999;background:#eee;min-height:44px;min-width:44px}"
+            ".tab-strip-btn-active{background:#2a6df4;color:#fff;border-color:#1c53c0}"
+            "#tab-strip-note{margin:.6em 0 0;color:#a33;font-weight:bold}"
+            "#tab-strip-note:empty{display:none}"
+            "</style>"
+            "<p id=tab-strip-watching dir=rtl></p>"
+            "<label id=tab-strip-autofollow-label dir=rtl>"
+            "<input type=checkbox id=tab-strip-autofollow> تابع الموظف تلقائي</label>"
+            "<ol id=tab-strip-list dir=rtl></ol>"
+            "<p id=tab-strip-note dir=rtl></p>"
+            "</section>"
             "<script src=/browser/tabs.js></script>"
-            if viewable else ""
         )
         return HTMLResponse(
             "<!doctype html><meta charset=utf-8><title>Secure Browser</title>"
             f"<h1>Secure Browser</h1><p>Signed in as {account}</p><p>Browser: {state}</p>"
             "<p><a href='/sites'>Manage allowed sites and assistant requests</a></p>"
             "<p><a href='/profiles'>احفظ الدخول (saved logins)</a></p>"
-            f"{viewer_link}"
             f"{tab_strip}"
+            f"{viewer_link}"
             f"{type_bridge}"
             "<h2>Open browser</h2><form method=post action=/api/browser/open>"
             f"<input type=hidden name=csrf_token value='{csrf}'>"
@@ -1752,7 +1927,8 @@ def create_app(
                 raise
             return RedirectResponse("/signin?next=%2Fviewer", status_code=303)
         require_sole_new_surface_owner(row)
-        if await viewer_session_id(row) is None:
+        viewer_state, _ = await viewer_access_state(row)
+        if viewer_state == "closed":
             return RedirectResponse("/browser", status_code=303)
         csrf = html.escape(request.cookies.get(CSRF_COOKIE, ""), quote=True)
         return HTMLResponse(
@@ -1764,7 +1940,12 @@ def create_app(
             "#remote-frame{position:fixed;inset:0;width:100vw;height:100dvh;border:0;background:#101714}"
             "#status{position:fixed;top:max(10px,env(safe-area-inset-top));left:12px;z-index:4;padding:7px 11px;"
             "border-radius:999px;background:#182d27d9;font-size:13px;box-shadow:0 2px 12px #0005;pointer-events:none}"
-            "#status[data-state=connected]{opacity:.58}#status[data-state=disconnected]{background:#7c2929}"
+            "#status[data-state=connected]{opacity:.58}#status[data-state=disconnected],#status[data-state=closed]{background:#7c2929}"
+            "#viewer-recovery{position:fixed;z-index:6;inset:0;display:grid;place-items:center;padding:24px;background:#101714e8}"
+            "#viewer-recovery[hidden]{display:none}#viewer-recovery div{max-width:420px;padding:22px;border-radius:18px;"
+            "background:#18352d;text-align:center;box-shadow:0 8px 32px #000a}#viewer-recovery p{font-size:18px;line-height:1.7}"
+            "#viewer-recovery a{display:inline-block;padding:12px 18px;border-radius:12px;background:#fff;color:#123f35;"
+            "font-weight:700;text-decoration:none}"
             ".tools{position:fixed;z-index:5;right:50%;bottom:max(12px,env(safe-area-inset-bottom));transform:translateX(50%);"
             "display:flex;gap:8px;padding:7px;border:1px solid #ffffff26;border-radius:18px;background:#102a23e8;box-shadow:0 6px 22px #0008}"
             "button,.back{min-width:46px;min-height:46px;border:0;border-radius:12px;background:#fff;color:#123f35;"
@@ -1782,6 +1963,8 @@ def create_app(
             f"<body data-csrf='{csrf}'>"
             "<iframe id=remote-frame title='شاشة المتصفح'></iframe>"
             "<p id=status>جاري الاتصال…</p>"
+            "<section id=viewer-recovery hidden><div><p>توقفت المشاهدة</p>"
+            "<a id=viewer-recovery-link href=/browser>فتح صفحة المتصفح</a></div></section>"
             "<nav class=tools aria-label='أدوات المتصفح'>"
             "<a class=back href=/browser title='رجوع'>↩</a>"
             "<button id=show-keyboard type=button title='الكتابة بالعربية'>⌨ <span class=label>كتابة</span></button>"
@@ -1803,6 +1986,14 @@ def create_app(
         row = session_for(request)
         require_sole_new_surface_owner(row)
         return Response(VIEWER_SCRIPT, media_type="text/javascript")
+
+    @app.get("/api/viewer/status")
+    async def viewer_status(request: Request):
+        """Report liveness without weakening the VNC authorization gate."""
+        row = session_for(request)
+        require_sole_new_surface_owner(row)
+        state, _ = await viewer_access_state(row)
+        return {"status": state}
 
     @app.post("/api/browser/type")
     async def type_into_browser(request: Request):
@@ -1857,6 +2048,12 @@ def create_app(
                 host = (urlsplit(url).hostname or "")[:253]
             except ValueError:
                 host = ""
+        tab_id = value.get("tab_id")
+        tab_id = tab_id if isinstance(tab_id, str) and re.fullmatch(r"t-[0-9a-f]{12}", tab_id) else None
+        last_action_at = value.get("last_action_at")
+        last_action_at = last_action_at if isinstance(last_action_at, (int, float)) and not isinstance(
+            last_action_at, bool
+        ) else None
         return {
             "index": index,
             "active": value.get("active") is True,
@@ -1864,6 +2061,10 @@ def create_app(
             "owner_label": TAB_OWNER_SELF_AR if owner is None else TAB_OWNER_NAMES_AR.get(owner, owner),
             "title": title[:120] if isinstance(title, str) else "",
             "host": host,
+            # Stable id (Balcony auto-follow matches on this across polls) and the last time a
+            # page-scoped call ran in this tab, both from the controller via the broker.
+            "tab_id": tab_id,
+            "last_action_at": last_action_at,
         }
 
     @app.get("/api/browser/tabs")
@@ -1943,6 +2144,42 @@ def create_app(
             _viewer_session_cache.pop(key, None)
         return value
 
+    async def viewer_access_state(row: Mapping[str, Any]) -> tuple[str, str | None]:
+        """Return open, closed, or temporarily unavailable for this identity.
+
+        Only an exact broker confirmation returns a session id. This lets the
+        viewer wait through an outage without weakening the fail-closed VNC
+        gate or treating a dead owner session as usable.
+        """
+        with closing(store.connect()) as db:
+            owner = db.execute(
+                "SELECT broker_session_id FROM browser_ownership_v2 WHERE user_id=? AND tenant_id=?",
+                (row["user_id"], row["tenant_id"]),
+            ).fetchone()
+        if owner is None or not owner["broker_session_id"]:
+            return "closed", None
+        selected_broker, selected_owner_token = broker_for(row["user_id"], row["tenant_id"])
+        try:
+            guard = await selected_broker.get(
+                BROKER_VISUAL_ACCESS_PATH, headers=internal_headers(selected_owner_token), timeout=5,
+            )
+        except httpx.HTTPError:
+            return "unavailable", None
+        if guard.status_code in {403, 410}:
+            return "closed", None
+        if guard.status_code != 200:
+            return "unavailable", None
+        try:
+            payload = guard.json() if guard.content else None
+            session_id = payload.get("session_id") if isinstance(payload, dict) else None
+        except ValueError:
+            return "unavailable", None
+        if not isinstance(session_id, str):
+            return "unavailable", None
+        if session_id != owner["broker_session_id"]:
+            return "closed", None
+        return "open", session_id
+
     async def viewer_session_id(row: Mapping[str, Any]) -> str | None:
         """The live broker session id for this identity, or None if there isn't one.
 
@@ -1951,29 +2188,8 @@ def create_app(
         a second on a timer, mirroring the broker's own `/owner/visual-access`
         guard so a closed or replaced session can never keep giving a view.
         """
-        with closing(store.connect()) as db:
-            owner = db.execute(
-                "SELECT broker_session_id FROM browser_ownership_v2 WHERE user_id=? AND tenant_id=?",
-                (row["user_id"], row["tenant_id"]),
-            ).fetchone()
-        if owner is None or not owner["broker_session_id"]:
-            return None
-        selected_broker, selected_owner_token = broker_for(row["user_id"], row["tenant_id"])
-        try:
-            guard = await selected_broker.get(
-                BROKER_VISUAL_ACCESS_PATH, headers=internal_headers(selected_owner_token), timeout=5,
-            )
-        except httpx.HTTPError:
-            return None
-        if guard.status_code != 200:
-            return None
-        try:
-            session_id = guard.json().get("session_id") if guard.content else None
-        except ValueError:
-            return None
-        if not isinstance(session_id, str) or session_id != owner["broker_session_id"]:
-            return None
-        return session_id
+        state, session_id = await viewer_access_state(row)
+        return session_id if state == "open" else None
 
     _VNC_DROP_REQUEST_HEADERS = {
         "host", "connection", "upgrade", "cookie", "authorization",

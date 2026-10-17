@@ -31,6 +31,12 @@ _DRIVER_DEAD_MARKERS = (
     "playwright connection closed",
 )
 
+_RENDERER_CRASH_MARKERS = (
+    "target crashed",
+    "page crashed",
+    "renderer process crashed",
+)
+
 
 def is_driver_dead_error(exc: BaseException | None) -> bool:
     """True when `exc` (or anything it was raised from) says the driver is gone."""
@@ -39,6 +45,23 @@ def is_driver_dead_error(exc: BaseException | None) -> bool:
         seen.add(id(exc))
         text = str(exc).lower()
         if any(marker in text for marker in _DRIVER_DEAD_MARKERS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def is_renderer_crash_error(exc: BaseException | None) -> bool:
+    """True when a browser call failed because one renderer target crashed.
+
+    This deliberately excludes the generic "target page/context/browser has
+    been closed" error: that is also emitted after the owner closes a window,
+    and must never cause the controller to open a replacement behind them.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        text = str(exc).lower()
+        if any(marker in text for marker in _RENDERER_CRASH_MARKERS):
             return True
         exc = exc.__cause__ or exc.__context__
     return False

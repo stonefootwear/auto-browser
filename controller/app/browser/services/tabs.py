@@ -4,7 +4,15 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from ...navigation_policy import await_public_dns_check
-from ..tab_view import TabView, set_tab_owner, tab_id_for, tab_owner, unwrap_session
+from ..tab_view import (
+    TabView,
+    forget_tab_activity,
+    set_tab_owner,
+    tab_id_for,
+    tab_last_action_at,
+    tab_owner,
+    unwrap_session,
+)
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -125,6 +133,7 @@ class BrowserTabService:
         closed_tab_id = tab_id_for(session, target_page)
         await target_page.close()
         set_tab_owner(session, closed_tab_id, None)
+        forget_tab_activity(session, closed_tab_id)
         remaining = self.pages(session)
         if was_active and remaining:
             session.page = remaining[max(0, min(index, len(remaining) - 1))]
@@ -144,9 +153,10 @@ class BrowserTabService:
         pages = getattr(session.context, "pages", None)
         if callable(pages):
             pages = pages()
+        crashed = getattr(session, "crashed_pages", {})
         if isinstance(pages, list) and pages:
-            return pages
-        return [session.page]
+            return [page for page in pages if page not in crashed]
+        return [] if session.page in crashed else [session.page]
 
     async def summaries(self, session: "BrowserSession") -> list[dict[str, Any]]:
         # "active" is the owner's active tab (the one in the live view), even
@@ -170,6 +180,7 @@ class BrowserTabService:
                     "title": title,
                     "tab_id": tab_id,
                     "owner": tab_owner(session, tab_id),
+                    "last_action_at": tab_last_action_at(session, tab_id),
                 }
             )
         return tabs
