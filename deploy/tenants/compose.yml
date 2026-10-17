@@ -11,7 +11,11 @@ services:
     # the idle reaper stopped (`compose stop`) stays stopped.
     restart: unless-stopped
     mem_limit: 6g
-    memswap_limit: 6g
+    # Keep a bounded swap escape hatch for host-wide pressure. Previously
+    # memory-swap == memory disabled swap entirely; global OOM killed Chrome
+    # even though this container had never reached its own 6 GiB limit.
+    memswap_limit: 8g
+    mem_reservation: 1g
     cpus: 4.0
     # pids counts THREADS. The shared launchServer() Chromium alone is ~100,
     # the owner's headed persistent profile ~150-250 (one renderer of ~15 per
@@ -79,7 +83,8 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
     mem_limit: 1g
-    memswap_limit: 1g
+    memswap_limit: 1536m
+    mem_reservation: 256m
     cpus: 2.0
     pids_limit: 128
     security_opt: [no-new-privileges:true]

@@ -196,8 +196,16 @@ const status = document.getElementById("status");
 const typingPanel = document.getElementById("typing-panel");
 const typingForm = document.getElementById("typing-form");
 const typingInput = document.getElementById("typing-input");
+const recoveryPanel = document.getElementById("viewer-recovery");
+const recoveryLink = document.getElementById("viewer-recovery-link");
 const csrf = document.body.dataset.csrf || "";
 let reconnectTimer = null;
+let connectWatchdogTimer = null;
+let reconnectAttempt = 0;
+let statusCheckInFlight = false;
+let reconnectStopped = false;
+const STATUS_TIMEOUT_MS = 8000;
+const CONNECT_TIMEOUT_MS = 10000;
 
 function remoteDocument() {
   try {
@@ -211,24 +219,91 @@ function remoteCanvas() {
   return remoteDocument()?.querySelector("#screen canvas") || null;
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer !== null) return;
-  status.textContent = "انقطع الاتصال — جاري إعادة الاتصال…";
+function scheduleReconnect(immediate = false) {
+  if (reconnectStopped || reconnectTimer !== null || statusCheckInFlight) return;
+  status.textContent = "\u0627\u0646\u0642\u0637\u0639 \u0627\u0644\u0627\u062a\u0635\u0627\u0644 \u2014 \u0633\u0646\u062d\u0627\u0648\u0644 \u0645\u0631\u0629 \u0623\u062e\u0631\u0649";
   status.dataset.state = "disconnected";
+  const delay = immediate ? 0 : Math.min(1500 * (2 ** reconnectAttempt), 15000);
+  if (!immediate) reconnectAttempt += 1;
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null;
-    connectViewer();
-  }, 1500);
+    checkViewerStatus();
+  }, delay);
+}
+
+function clearConnectWatchdog() {
+  if (connectWatchdogTimer !== null) window.clearTimeout(connectWatchdogTimer);
+  connectWatchdogTimer = null;
+}
+
+function stopReconnect(message, href, label) {
+  reconnectStopped = true;
+  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  clearConnectWatchdog();
+  frame.src = "about:blank";
+  status.textContent = message;
+  status.dataset.state = "closed";
+  recoveryLink.href = href;
+  recoveryLink.textContent = label;
+  recoveryPanel.hidden = false;
+}
+
+async function checkViewerStatus() {
+  if (reconnectStopped || statusCheckInFlight) return;
+  statusCheckInFlight = true;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
+  try {
+    const response = await fetch("/api/viewer/status", {
+      credentials: "same-origin",
+      headers: {"Accept": "application/json"},
+      signal: controller.signal,
+    });
+    if (response.status === 401 || response.status === 403) {
+      stopReconnect(
+        "\u0627\u0646\u062a\u0647\u062a \u062c\u0644\u0633\u0629 \u0627\u0644\u062f\u062e\u0648\u0644",
+        "/signin?next=%2Fviewer",
+        "\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u062f\u062e\u0648\u0644"
+      );
+      return;
+    }
+    if (!response.ok) throw new Error(String(response.status));
+    const data = await response.json();
+    if (data.status === "closed") {
+      stopReconnect(
+        "\u0627\u0644\u0645\u062a\u0635\u0641\u062d \u0645\u063a\u0644\u0642. \u0627\u0631\u062c\u0639 \u0648\u0627\u0641\u062a\u062d\u0647 \u0645\u0646 \u062c\u062f\u064a\u062f.",
+        "/browser",
+        "\u0641\u062a\u062d \u0635\u0641\u062d\u0629 \u0627\u0644\u0645\u062a\u0635\u0641\u062d"
+      );
+      return;
+    }
+    if (data.status === "open") {
+      connectViewer();
+      return;
+    }
+  } catch (_) {
+    // Keep the page steady during a temporary upstream outage. The next
+    // attempt checks status again before noVNC is reloaded.
+  } finally {
+    window.clearTimeout(timeout);
+    statusCheckInFlight = false;
+  }
+  scheduleReconnect();
 }
 
 function syncRemoteStatus(remoteStatus) {
+  if (reconnectStopped) return;
   const value = (remoteStatus?.textContent || "").trim().toLowerCase();
   if (value.startsWith("connected")) {
+    clearConnectWatchdog();
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     reconnectTimer = null;
-    status.textContent = "تم الاتصال";
+    reconnectAttempt = 0;
+    status.textContent = "\u062a\u0645 \u0627\u0644\u0627\u062a\u0635\u0627\u0644";
     status.dataset.state = "connected";
   } else if (value.includes("disconnected") || value.includes("wrong") || value.includes("closed")) {
+    clearConnectWatchdog();
     scheduleReconnect();
   } else {
     status.textContent = "جاري الاتصال…";
@@ -237,14 +312,17 @@ function syncRemoteStatus(remoteStatus) {
 }
 
 function prepareRemoteViewer() {
+  if (reconnectStopped) return;
   const doc = remoteDocument();
   if (!doc) {
+    clearConnectWatchdog();
     scheduleReconnect();
     return;
   }
   const remoteStatus = doc.getElementById("status");
   const remoteScreen = doc.getElementById("screen");
   if (!remoteStatus || !remoteScreen) {
+    clearConnectWatchdog();
     scheduleReconnect();
     return;
   }
@@ -277,6 +355,8 @@ function prepareRemoteViewer() {
 }
 
 function connectViewer() {
+  if (reconnectStopped) return;
+  clearConnectWatchdog();
   status.textContent = "جاري الاتصال…";
   status.dataset.state = "connecting";
   const url = new URL("/vnc/vnc_lite.html", window.location.href);
@@ -284,6 +364,10 @@ function connectViewer() {
   url.searchParams.set("scale", "true");
   url.searchParams.set("attempt", String(Date.now()));
   frame.src = url.href;
+  connectWatchdogTimer = window.setTimeout(() => {
+    connectWatchdogTimer = null;
+    scheduleReconnect();
+  }, CONNECT_TIMEOUT_MS);
 }
 
 function dispatchWheel(deltaX, deltaY, amplifiedEvents = null) {
@@ -347,7 +431,7 @@ document.getElementById("fullscreen").addEventListener("click", async () => {
   }
 });
 
-connectViewer();
+scheduleReconnect(true);
 """
 
 SECURITY_HEADERS = {
@@ -1843,7 +1927,8 @@ def create_app(
                 raise
             return RedirectResponse("/signin?next=%2Fviewer", status_code=303)
         require_sole_new_surface_owner(row)
-        if await viewer_session_id(row) is None:
+        viewer_state, _ = await viewer_access_state(row)
+        if viewer_state == "closed":
             return RedirectResponse("/browser", status_code=303)
         csrf = html.escape(request.cookies.get(CSRF_COOKIE, ""), quote=True)
         return HTMLResponse(
@@ -1855,7 +1940,12 @@ def create_app(
             "#remote-frame{position:fixed;inset:0;width:100vw;height:100dvh;border:0;background:#101714}"
             "#status{position:fixed;top:max(10px,env(safe-area-inset-top));left:12px;z-index:4;padding:7px 11px;"
             "border-radius:999px;background:#182d27d9;font-size:13px;box-shadow:0 2px 12px #0005;pointer-events:none}"
-            "#status[data-state=connected]{opacity:.58}#status[data-state=disconnected]{background:#7c2929}"
+            "#status[data-state=connected]{opacity:.58}#status[data-state=disconnected],#status[data-state=closed]{background:#7c2929}"
+            "#viewer-recovery{position:fixed;z-index:6;inset:0;display:grid;place-items:center;padding:24px;background:#101714e8}"
+            "#viewer-recovery[hidden]{display:none}#viewer-recovery div{max-width:420px;padding:22px;border-radius:18px;"
+            "background:#18352d;text-align:center;box-shadow:0 8px 32px #000a}#viewer-recovery p{font-size:18px;line-height:1.7}"
+            "#viewer-recovery a{display:inline-block;padding:12px 18px;border-radius:12px;background:#fff;color:#123f35;"
+            "font-weight:700;text-decoration:none}"
             ".tools{position:fixed;z-index:5;right:50%;bottom:max(12px,env(safe-area-inset-bottom));transform:translateX(50%);"
             "display:flex;gap:8px;padding:7px;border:1px solid #ffffff26;border-radius:18px;background:#102a23e8;box-shadow:0 6px 22px #0008}"
             "button,.back{min-width:46px;min-height:46px;border:0;border-radius:12px;background:#fff;color:#123f35;"
@@ -1873,6 +1963,8 @@ def create_app(
             f"<body data-csrf='{csrf}'>"
             "<iframe id=remote-frame title='شاشة المتصفح'></iframe>"
             "<p id=status>جاري الاتصال…</p>"
+            "<section id=viewer-recovery hidden><div><p>توقفت المشاهدة</p>"
+            "<a id=viewer-recovery-link href=/browser>فتح صفحة المتصفح</a></div></section>"
             "<nav class=tools aria-label='أدوات المتصفح'>"
             "<a class=back href=/browser title='رجوع'>↩</a>"
             "<button id=show-keyboard type=button title='الكتابة بالعربية'>⌨ <span class=label>كتابة</span></button>"
@@ -1894,6 +1986,14 @@ def create_app(
         row = session_for(request)
         require_sole_new_surface_owner(row)
         return Response(VIEWER_SCRIPT, media_type="text/javascript")
+
+    @app.get("/api/viewer/status")
+    async def viewer_status(request: Request):
+        """Report liveness without weakening the VNC authorization gate."""
+        row = session_for(request)
+        require_sole_new_surface_owner(row)
+        state, _ = await viewer_access_state(row)
+        return {"status": state}
 
     @app.post("/api/browser/type")
     async def type_into_browser(request: Request):
@@ -2044,6 +2144,42 @@ def create_app(
             _viewer_session_cache.pop(key, None)
         return value
 
+    async def viewer_access_state(row: Mapping[str, Any]) -> tuple[str, str | None]:
+        """Return open, closed, or temporarily unavailable for this identity.
+
+        Only an exact broker confirmation returns a session id. This lets the
+        viewer wait through an outage without weakening the fail-closed VNC
+        gate or treating a dead owner session as usable.
+        """
+        with closing(store.connect()) as db:
+            owner = db.execute(
+                "SELECT broker_session_id FROM browser_ownership_v2 WHERE user_id=? AND tenant_id=?",
+                (row["user_id"], row["tenant_id"]),
+            ).fetchone()
+        if owner is None or not owner["broker_session_id"]:
+            return "closed", None
+        selected_broker, selected_owner_token = broker_for(row["user_id"], row["tenant_id"])
+        try:
+            guard = await selected_broker.get(
+                BROKER_VISUAL_ACCESS_PATH, headers=internal_headers(selected_owner_token), timeout=5,
+            )
+        except httpx.HTTPError:
+            return "unavailable", None
+        if guard.status_code in {403, 410}:
+            return "closed", None
+        if guard.status_code != 200:
+            return "unavailable", None
+        try:
+            payload = guard.json() if guard.content else None
+            session_id = payload.get("session_id") if isinstance(payload, dict) else None
+        except ValueError:
+            return "unavailable", None
+        if not isinstance(session_id, str):
+            return "unavailable", None
+        if session_id != owner["broker_session_id"]:
+            return "closed", None
+        return "open", session_id
+
     async def viewer_session_id(row: Mapping[str, Any]) -> str | None:
         """The live broker session id for this identity, or None if there isn't one.
 
@@ -2052,29 +2188,8 @@ def create_app(
         a second on a timer, mirroring the broker's own `/owner/visual-access`
         guard so a closed or replaced session can never keep giving a view.
         """
-        with closing(store.connect()) as db:
-            owner = db.execute(
-                "SELECT broker_session_id FROM browser_ownership_v2 WHERE user_id=? AND tenant_id=?",
-                (row["user_id"], row["tenant_id"]),
-            ).fetchone()
-        if owner is None or not owner["broker_session_id"]:
-            return None
-        selected_broker, selected_owner_token = broker_for(row["user_id"], row["tenant_id"])
-        try:
-            guard = await selected_broker.get(
-                BROKER_VISUAL_ACCESS_PATH, headers=internal_headers(selected_owner_token), timeout=5,
-            )
-        except httpx.HTTPError:
-            return None
-        if guard.status_code != 200:
-            return None
-        try:
-            session_id = guard.json().get("session_id") if guard.content else None
-        except ValueError:
-            return None
-        if not isinstance(session_id, str) or session_id != owner["broker_session_id"]:
-            return None
-        return session_id
+        state, session_id = await viewer_access_state(row)
+        return session_id if state == "open" else None
 
     _VNC_DROP_REQUEST_HEADERS = {
         "host", "connection", "upgrade", "cookie", "authorization",

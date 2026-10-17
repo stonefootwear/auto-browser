@@ -38,6 +38,7 @@ class Upstreams:
         self.broker_assertions: set[str] = set()
         self.active = False
         self.fail_active_binding = False
+        self.visual_access_error_status: int | None = None
         self.site_requests: list[dict] = []
         self.profile_calls: list[tuple] = []
         self.saved_profiles: set[str] = set()
@@ -94,6 +95,8 @@ class Upstreams:
             self.active = False
             return httpx.Response(200, json={"owner_credential": BROKER_TOKEN})
         if request.method == "GET" and request.url.path == "/owner/visual-access":
+            if self.visual_access_error_status is not None:
+                return httpx.Response(self.visual_access_error_status)
             if self.active:
                 return httpx.Response(200, json={"session_id": "browser-1"})
             return httpx.Response(403, json={"detail": "Owner must open a verified browser session first"})
@@ -749,6 +752,39 @@ def test_browser_page_stops_offering_a_dead_viewer_link_after_a_broker_restart(t
         assert reopened.status_code == 200
         healed_page = client.get("/browser").text
         assert "href='/viewer'" in healed_page
+
+
+def test_viewer_distinguishes_terminal_close_from_temporary_broker_outage(tmp_path, clock, upstreams):
+    """A temporary outage keeps the authenticated shell but never opens VNC.
+
+    A confirmed dead owner session is terminal and sends the owner back to the
+    existing browser page, where opening still requires the normal human flow.
+    """
+    with TestClient(app_at(tmp_path, clock, upstreams), base_url=ORIGIN) as client:
+        csrf = login(client)
+        client.post("/api/browser/open", headers=mutate(csrf), json={})
+        assert client.get("/api/viewer/status").json() == {"status": "open"}
+
+        upstreams.visual_access_error_status = 503
+        temporary = client.get("/api/viewer/status")
+        assert temporary.status_code == 200
+        assert temporary.json() == {"status": "unavailable"}
+        assert client.get("/viewer").status_code == 200
+        assert client.get("/vnc/vnc_lite.html").status_code == 403
+
+        upstreams.visual_access_error_status = None
+        upstreams.active = False
+        terminal = client.get("/api/viewer/status")
+        assert terminal.status_code == 200
+        assert terminal.json() == {"status": "closed"}
+        redirected = client.get("/viewer", follow_redirects=False)
+        assert redirected.status_code == 303
+        assert redirected.headers["location"] == "/browser"
+
+
+def test_viewer_status_requires_the_signed_in_owner(tmp_path, clock, upstreams):
+    with TestClient(app_at(tmp_path, clock, upstreams), base_url=ORIGIN) as client:
+        assert client.get("/api/viewer/status").status_code == 401
 
 
 def test_all_responses_get_security_headers_and_mutations_require_origin(tmp_path, clock, upstreams):

@@ -153,9 +153,10 @@ class BrowserTabService:
         pages = getattr(session.context, "pages", None)
         if callable(pages):
             pages = pages()
+        crashed = getattr(session, "crashed_pages", {})
         if isinstance(pages, list) and pages:
-            return pages
-        return [session.page]
+            return [page for page in pages if page not in crashed]
+        return [] if session.page in crashed else [session.page]
 
     async def summaries(self, session: "BrowserSession") -> list[dict[str, Any]]:
         # "active" is the owner's active tab (the one in the live view), even

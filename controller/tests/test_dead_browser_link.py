@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.browser.services.connection_health import (
     is_driver_dead_error,
+    is_renderer_crash_error,
     playwright_driver_alive,
     session_connection_problem,
 )
@@ -58,12 +59,17 @@ class FakePage:
         self.set_default_timeout = MagicMock()
         self.on = MagicMock()
         self.closed = False
+        self.bring_to_front = AsyncMock()
+        self.close = AsyncMock(side_effect=self._close)
 
     def is_closed(self) -> bool:
         return self.closed
 
     async def title(self) -> str:
         return "Google"
+
+    async def _close(self, **_kwargs) -> None:
+        self.closed = True
 
 
 def _settings(root: Path) -> Settings:
@@ -102,6 +108,13 @@ class ConnectionHealthTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(is_driver_dead_error(outer))
         self.assertFalse(is_driver_dead_error(Exception("Target page, context or browser has been closed")))
         self.assertFalse(is_driver_dead_error(None))
+
+    async def test_renderer_crash_errors_exclude_manual_page_close(self) -> None:
+        self.assertTrue(is_renderer_crash_error(Exception("Page.screenshot: Target crashed")))
+        self.assertTrue(is_renderer_crash_error(RuntimeError("renderer process crashed")))
+        self.assertFalse(
+            is_renderer_crash_error(Exception("Target page, context or browser has been closed"))
+        )
 
     async def test_driver_alive_reads_the_client_transport_state(self) -> None:
         self.assertTrue(playwright_driver_alive(_fake_playwright(dead=False)))
@@ -304,6 +317,248 @@ class DeadLinkRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*(self.manager.session_lifecycle.reap_dead_sessions() for _ in range(5)))
         self.assertEqual(self.async_playwright.call_count, 1)
         self.manager.persistent_profiles.open.assert_awaited_once()
+
+    async def test_crash_event_adopts_an_unaffected_tab_without_reattaching(self) -> None:
+        self.manager.playwright = self.new_driver  # type: ignore[assignment]
+        self.manager.persistent_profiles.open = AsyncMock()  # type: ignore[method-assign]
+        session = self._session(persistent=True)
+        crashed = session.page
+        healthy = FakePage("https://mail.google.com/inbox")
+        session.context.pages = [crashed, healthy]
+        session.context.new_page = AsyncMock()
+        self.manager._attach_page_listeners(crashed, session)
+
+        crash_handler = next(
+            call.args[1] for call in crashed.on.call_args_list if call.args[0] == "crash"
+        )
+        crash_handler(crashed)
+        await self.manager.session_lifecycle.reap_dead_sessions()
+
+        self.assertIs(session.page, healthy)
+        self.assertEqual(session.renderer_recovery_count, 1)
+        session.context.new_page.assert_not_awaited()
+        self.manager.persistent_profiles.open.assert_not_awaited()
+        session.browser.close.assert_not_awaited()
+        self.assertEqual(self.manager.tabs.pages(session), [healthy])
+        recovered = [
+            call for call in self.manager.audit.append.await_args_list
+            if call.kwargs.get("event_type") == "renderer_crash_recovered"
+        ]
+        self.assertEqual(recovered[0].kwargs["details"]["reason"], "Playwright page crash event")
+
+    async def test_only_crashed_tab_gets_a_replacement_in_the_same_context(self) -> None:
+        self.manager.playwright = self.new_driver  # type: ignore[assignment]
+        self.manager.persistent_profiles.open = AsyncMock()  # type: ignore[method-assign]
+        session = self._session(persistent=True)
+        crashed = session.page
+        replacement = FakePage("about:blank")
+        session.context.pages = [crashed]
+        session.context.new_page = AsyncMock(return_value=replacement)
+
+        self.assertTrue(
+            self.manager.session_lifecycle.note_page_crash(
+                session, crashed, source="Page.screenshot: Target crashed"
+            )
+        )
+        await self.manager.session_lifecycle.reap_dead_sessions()
+
+        self.assertIs(session.page, replacement)
+        session.context.new_page.assert_awaited_once()
+        crashed.close.assert_awaited_once_with(run_before_unload=False)
+        self.manager.persistent_profiles.open.assert_not_awaited()
+        session.browser.close.assert_not_awaited()
+        self.assertEqual(session.last_renderer_crash_reason, "Page.screenshot: Target crashed")
+
+    async def test_manual_last_window_close_is_retired_not_reopened(self) -> None:
+        self.manager.playwright = self.new_driver  # type: ignore[assignment]
+        self.manager.persistent_profiles.open = AsyncMock()  # type: ignore[method-assign]
+        session = self._session(persistent=True)
+        crashed = session.page
+        crashed.closed = True
+        session.context.pages = []
+        session.context.new_page = AsyncMock()
+
+        self.manager.session_lifecycle.note_page_crash(
+            session, crashed, source="Playwright page crash event"
+        )
+        await self.manager.session_lifecycle.reap_dead_sessions()
+
+        self.assertNotIn(session.id, self.manager.sessions)
+        session.context.new_page.assert_not_awaited()
+        self.manager.persistent_profiles.open.assert_not_awaited()
+
+    async def test_queued_recovery_cannot_resurrect_a_revoked_session(self) -> None:
+        self.manager.playwright = self.new_driver  # type: ignore[assignment]
+        session = self._session(persistent=True)
+        crashed = session.page
+        replacement = FakePage()
+        session.context.pages = [crashed]
+        session.context.new_page = AsyncMock(return_value=replacement)
+        session.crashed_pages[crashed] = "Target crashed"
+        session.pending_crashed_pages.add(crashed)
+        self.manager.sessions.pop(session.id)
+
+        recovered = await self.manager.session_lifecycle.recover_crashed_page(
+            session, crashed, reason="Target crashed"
+        )
+
+        self.assertFalse(recovered)
+        self.assertNotIn(session.id, self.manager.sessions)
+        session.context.new_page.assert_not_awaited()
+
+    async def test_guarded_surfaces_renderer_reason_and_schedules_recovery(self) -> None:
+        from app.action_errors import BrowserActionError
+
+        self.manager.playwright = self.new_driver  # type: ignore[assignment]
+        session = self._session(persistent=True)
+        session.context.pages = [session.page]
+
+        async def target_crashed() -> None:
+            raise RuntimeError("Page.screenshot: Target crashed")
+
+        async with session.lock:
+            with self.assertRaises(BrowserActionError) as raised:
+                await self.manager.session_lifecycle.guarded(
+                    session, target_crashed(), what="observe", timeout=1
+                )
+
+            self.assertEqual(raised.exception.payload["code"], "renderer_crashed")
+            self.assertEqual(raised.exception.payload["reason"], "Page.screenshot: Target crashed")
+            self.assertIn(session.page, session.pending_crashed_pages)
+            # Simulate revocation before the queued recovery can acquire the lock.
+            self.manager.sessions.pop(session.id)
+        await asyncio.sleep(0)
+
+    async def test_renderer_recovery_is_bounded_then_retires_without_relaunch(self) -> None:
+        self.manager.playwright = self.new_driver  # type: ignore[assignment]
+        self.manager.persistent_profiles.open = AsyncMock()  # type: ignore[method-assign]
+        session = self._session(persistent=True)
+        crashed = session.page
+        session.context.pages = [crashed]
+        session.context.new_page = AsyncMock(side_effect=RuntimeError("cannot create target"))
+        session.crashed_pages[crashed] = "Target crashed"
+        session.pending_crashed_pages.add(crashed)
+
+        for _ in range(3):
+            session.renderer_retry_after.pop(crashed, None)
+            await self.manager.session_lifecycle.reap_dead_sessions()
+
+        self.assertNotIn(session.id, self.manager.sessions)
+        self.assertEqual(session.context.new_page.await_count, 3)
+        self.manager.persistent_profiles.open.assert_not_awaited()
+        self.manager.persistent_profiles.close.assert_not_awaited()
+
+    async def test_reattach_quarantines_known_crashed_target_and_keeps_healthy_tab(self) -> None:
+        session = self._session(persistent=True)
+        old_crashed = session.page
+        old_healthy = FakePage("https://mail.google.com/inbox")
+        session.context.pages = [old_crashed, old_healthy]
+        session.crashed_pages[old_crashed] = "Target crashed"
+        session.pending_crashed_pages.add(old_crashed)
+
+        new_crashed = FakePage(old_crashed.url)
+        new_healthy = FakePage(old_healthy.url)
+        new_context = MagicMock()
+        new_context.pages = [new_crashed, new_healthy]
+        new_context.new_page = AsyncMock()
+        new_browser = FakeBrowser()
+        self.manager.persistent_profiles.open = AsyncMock(  # type: ignore[method-assign]
+            return_value=PersistentProfileHandle(
+                name="owner-default",
+                cdp_endpoint="ws://browser-node/profile",
+                already_open=True,
+                seeded=False,
+                was_empty=False,
+                generation="gen-2",
+            )
+        )
+        self.manager.runtime.attach_persistent_context = AsyncMock(  # type: ignore[method-assign]
+            return_value=SimpleNamespace(browser=new_browser, context=new_context, handle=None)
+        )
+
+        await self.manager.session_lifecycle.reap_dead_sessions()
+
+        self.assertIs(session.page, new_healthy)
+        self.assertIn(new_crashed, session.crashed_pages)
+        self.assertEqual(self.manager.tabs.pages(session), [new_healthy])
+        new_context.new_page.assert_not_awaited()
+
+    async def test_reattach_new_page_timeout_retires_and_releases_the_lock(self) -> None:
+        session = self._session(persistent=True)
+        old_crashed = session.page
+        session.context.pages = [old_crashed]
+        session.crashed_pages[old_crashed] = "Target crashed"
+        session.pending_crashed_pages.add(old_crashed)
+
+        new_crashed = FakePage(old_crashed.url)
+        new_context = MagicMock()
+        new_context.pages = [new_crashed]
+
+        async def never_create_page():
+            await asyncio.Event().wait()
+
+        new_context.new_page = AsyncMock(side_effect=never_create_page)
+        self.manager.persistent_profiles.open = AsyncMock(  # type: ignore[method-assign]
+            return_value=PersistentProfileHandle(
+                name="owner-default",
+                cdp_endpoint="ws://browser-node/profile",
+                already_open=True,
+                seeded=False,
+                was_empty=False,
+                generation="gen-2",
+            )
+        )
+        self.manager.runtime.attach_persistent_context = AsyncMock(  # type: ignore[method-assign]
+            return_value=SimpleNamespace(browser=FakeBrowser(), context=new_context, handle=None)
+        )
+
+        with patch(
+            "app.browser.services.sessions.REATTACH_NEW_PAGE_TIMEOUT_SECONDS", 0.01
+        ):
+            await asyncio.wait_for(
+                self.manager.session_lifecycle.reap_dead_sessions(), timeout=1
+            )
+
+        self.assertNotIn(session.id, self.manager.sessions)
+        self.assertFalse(session.lock.locked())
+        new_context.new_page.assert_awaited_once()
+        self.manager.persistent_profiles.open.assert_awaited_once()
+        # The failed re-attach lease is released exactly once; no second Open
+        # can relaunch the profile behind the owner.
+        self.manager.persistent_profiles.close.assert_awaited_once_with(
+            "owner-default", generation="gen-2"
+        )
+        self.assertEqual(self.async_playwright.call_count, 1)
+
+    async def test_action_pipeline_does_not_probe_a_crashed_renderer_again(self) -> None:
+        from playwright.async_api import Error as PlaywrightError
+
+        from app.action_errors import BrowserActionError
+        from app.actions.pipeline import ActionRunContext
+
+        self.manager.playwright = self.new_driver  # type: ignore[assignment]
+        session = self._session(persistent=True)
+        pipeline = self.manager.action_pipeline
+        pipeline._prepare = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+        pipeline._execute = AsyncMock(  # type: ignore[method-assign]
+            side_effect=PlaywrightError("Page.click: Target crashed")
+        )
+        pipeline._handle_playwright_error = AsyncMock()  # type: ignore[method-assign]
+        context = ActionRunContext(
+            manager=self.manager,
+            session=session,
+            action_name="click",
+            target={},
+            operation=AsyncMock(),
+        )
+
+        with self.assertRaises(BrowserActionError) as raised:
+            await pipeline.run(context)
+
+        self.assertEqual(raised.exception.code, "renderer_crashed")
+        pipeline._handle_playwright_error.assert_not_awaited()
+        self.manager.sessions.pop(session.id)
+        await asyncio.sleep(0)
 
     async def test_a_hung_observe_answers_504_frees_the_lock_and_reattaches(self) -> None:
         """2026-09-25 04:01: an employee's observe never returned, held the
