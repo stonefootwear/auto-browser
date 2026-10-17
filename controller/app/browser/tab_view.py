@@ -20,16 +20,22 @@ Locking (see ``SessionLock``):
 from __future__ import annotations
 
 import asyncio
+import time
 import weakref
 from typing import Any, Iterable
 
 from .tab_scope import new_tab_id
 
+# tab_id-keyed registries (plain dicts, survive the page they were recorded
+# against being replaced/closed) vs page-keyed ones (WeakKeyDictionary, so a
+# closed page's entry is reclaimed automatically).
+_TAB_ID_KEYED = frozenset({"tab_owners", "tab_last_action_at"})
+
 
 def _registry(session: Any, name: str) -> Any:
     registry = getattr(session, name, None)
     if registry is None:
-        registry = {} if name == "tab_owners" else weakref.WeakKeyDictionary()
+        registry = {} if name in _TAB_ID_KEYED else weakref.WeakKeyDictionary()
         setattr(session, name, registry)
     return registry
 
@@ -60,6 +66,20 @@ def set_tab_owner(session: Any, tab_id: str, owner: str | None) -> None:
         owners[tab_id] = owner
     else:
         owners.pop(tab_id, None)
+
+
+def mark_tab_activity(session: Any, tab_id: str, *, when: float | None = None) -> None:
+    """Record that a page-scoped call just ran in this tab (Balcony auto-follow reads this
+    to tell which employee tab is "live" right now)."""
+    _registry(unwrap_session(session), "tab_last_action_at")[tab_id] = when if when is not None else time.time()
+
+
+def tab_last_action_at(session: Any, tab_id: str) -> float | None:
+    return _registry(unwrap_session(session), "tab_last_action_at").get(tab_id)
+
+
+def forget_tab_activity(session: Any, tab_id: str) -> None:
+    _registry(unwrap_session(session), "tab_last_action_at").pop(tab_id, None)
 
 
 def page_lock_for(session: Any, page: Any) -> asyncio.Lock:
