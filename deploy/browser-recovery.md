@@ -76,6 +76,22 @@ integrity checks. The optional real-browser probe is
 `smoke/renderer_recovery.py`; run it only against a disposable browser server
 on a temporary private network, never the owner's live profile.
 
+That probe passed against the built controller image in both cases: adopt an
+existing healthy tab, and create a replacement when none exists. It retained
+the same session/context and synthetic cookie and rejected a late crash event
+after revocation. No production profile or public port was used for the probe.
+
+For this code-only release, images were built as small code overlays on the
+exact saved deployed image IDs (local tags
+`auto-browser-controller-base:recovery-20261017` and
+`auto-browser-portal-base:recovery-20261017`). A normal controller build was
+cancelled when its moving Python base would have rebuilt system/npm dependencies;
+no dependency upgrade is part of this incident fix. The controller overlay
+copies `controller/app`, `controller/tests`, and `controller/pyproject.toml` to
+their existing `/app` locations. The portal overlay copies only `portal` to
+`/app/portal`. The compose image tags remain unchanged. Reuse the retained base
+tags/image IDs to reproduce the code-only build rather than pulling a new base.
+
 Rollback code by redeploying the saved image IDs for only portal/controller;
 do not restore a database over newer user activity. The browser runtime itself
 need not restart for these changes. To roll back resource settings, first
