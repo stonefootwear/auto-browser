@@ -339,6 +339,11 @@ PAGE_SUMMARY_SCRIPT = r"""
 (textLimit) => {
   const squash = (value, maxLength = textLimit) =>
     String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+  // Match interactables: only button-like inputs expose their value as a visible caption.
+  // Hidden tokens, passwords and other editable values are never field labels.
+  const buttonValue = (field) => field.tagName === 'INPUT'
+    && ['button', 'submit', 'reset'].includes((field.getAttribute('type') || '').toLowerCase())
+    ? field.value : '';
 
   const headings = Array.from(document.querySelectorAll('h1,h2,h3'))
     .slice(0, 8)
@@ -363,7 +368,7 @@ PAGE_SUMMARY_SCRIPT = r"""
             field.getAttribute('aria-label')
               || field.getAttribute('placeholder')
               || field.innerText
-              || field.value
+              || buttonValue(field)
               || field.getAttribute('name')
               || field.id,
             80
