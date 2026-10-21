@@ -344,6 +344,8 @@ PAGE_SUMMARY_SCRIPT = r"""
   const buttonValue = (field) => field.tagName === 'INPUT'
     && ['button', 'submit', 'reset'].includes((field.getAttribute('type') || '').toLowerCase())
     ? field.value : '';
+  const visibleCaption = (field) => ['BUTTON', 'SELECT'].includes(field.tagName)
+    ? field.innerText : '';
 
   const headings = Array.from(document.querySelectorAll('h1,h2,h3'))
     .slice(0, 8)
@@ -367,7 +369,7 @@ PAGE_SUMMARY_SCRIPT = r"""
           label: squash(
             field.getAttribute('aria-label')
               || field.getAttribute('placeholder')
-              || field.innerText
+              || visibleCaption(field)
               || buttonValue(field)
               || field.getAttribute('name')
               || field.id,
