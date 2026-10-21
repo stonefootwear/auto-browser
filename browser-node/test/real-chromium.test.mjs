@@ -163,6 +163,30 @@ after(async () => {
   }
 });
 
+test("persistent prompts stay open for controller answers on existing and new pages", async () => {
+  const opened = await control("/profiles/open", { name: "dialog-owner", owner: "op1" });
+  assert.equal(opened.status, 200, JSON.stringify(opened.body));
+  const browser = await attach(opened.body.cdp_endpoint);
+  try {
+    const context = browser.contexts()[0];
+    const existing = context.pages()[0];
+    assert.ok(existing, "persistent context must expose its initial page");
+    for (const page of [existing, await context.newPage()]) {
+      await page.setContent('<button onclick="document.querySelector(\'output\').textContent=String(prompt(\'Test prompt\'))">Prompt</button><output></output>');
+      const dialogOpened = page.waitForEvent("dialog");
+      const clicked = page.getByRole("button", { name: "Prompt", exact: true }).click();
+      const dialog = await dialogOpened;
+      assert.equal(dialog.type(), "prompt");
+      await dialog.accept("controller-answer");
+      await clicked;
+      assert.equal(await page.locator("output").innerText(), "controller-answer");
+    }
+  } finally {
+    await browser.close();
+    await closeLatest("dialog-owner");
+  }
+});
+
 test("control API refuses missing or wrong bearer token", async () => {
   assert.equal((await control("/profiles/open", { name: "alpha" }, { token: null })).status, 401);
   assert.equal((await control("/profiles/open", { name: "alpha" }, { token: "wrong" })).status, 401);

@@ -593,6 +593,11 @@ async function launchProfile(name, opts, owner) {
   const seeded = Boolean(wasEmpty && opts.storage_state);
 
   const context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+  // This launch client stays connected alongside the controller's CDP client.
+  // Without a listener it auto-dismisses dialogs even when the controller is
+  // holding them for an owner answer. Cover existing and future pages without
+  // accepting, dismissing, logging or otherwise deciding on any dialog here.
+  context.on("dialog", () => {});
   let discovered;
   try {
     if (seeded) {
