@@ -4,9 +4,11 @@ import asyncio
 import logging
 import shutil
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from ...browser_scripts import VALIDATION_MESSAGES_SCRIPT
 from ...downloads import DownloadCaptureService
@@ -41,6 +43,9 @@ class BrowserDiagnosticsService:
         self.manager = manager
         self.pii_scrubber = pii_scrubber
         self.download_capture = download_capture
+        # Page identity alone survives reloads; URLs also survive same-URL reloads.
+        self._navigation_ids: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+        self._request_scopes: weakref.WeakKeyDictionary[Any, tuple[Any, str]] = weakref.WeakKeyDictionary()
 
     async def get_console_messages(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
         session = await self.manager.get_session(session_id)
@@ -111,11 +116,15 @@ class BrowserDiagnosticsService:
         if page in session.attached_pages:
             return
         session.attached_pages.add(page)
+        self._navigation_ids[page] = uuid4().hex
+        page.on("framenavigated", lambda frame: self._on_navigation(session, page, frame))
+        page.on("request", lambda request: self._on_request(page, request))
+        page.on("requestfinished", lambda request: self._request_scopes.pop(request, None))
 
         page.on("console", lambda message: self._on_console(session, page, message))
         page.on("pageerror", lambda error: self._on_pageerror(session, page, error))
         page.on("requestfailed", lambda request: self._on_request_failed(session, page, request))
-        page.on("response", lambda response: spawn_background_task(self._on_response(session, page, response)))
+        page.on("response", lambda response: self._schedule_response(session, page, response))
         page.on("download", lambda download: spawn_background_task(self.manager._handle_download(session, download)))
         # Remember the newest file chooser whoever opened it (see
         # FileTransferService.attach): Google Flow's "Upload" opens the native
@@ -139,15 +148,50 @@ class BrowserDiagnosticsService:
     # observe(), unchanged) and this page's own tab buffer (used by
     # get_diagnostics() / build_digest()) ──────────────────────────────────
 
+    def _on_navigation(self, session: "BrowserSession", page: "Page", frame: Any) -> None:
+        if frame is page.main_frame:
+            self._navigation_ids[page] = uuid4().hex
+            self._scope_buffer(session, page, self._navigation_ids[page])
+
+    def _scope_buffer(self, session: "BrowserSession", page: "Page", navigation_id: str | None) -> Any:
+        if navigation_id is None or self._navigation_ids.get(page) != navigation_id:
+            return None
+        buf = get_buffer(session, tab_id_for(session, page))
+        # A stable tab ID can be rebound to another Page (popup follow).
+        if getattr(buf, "_navigation_id", None) != navigation_id:
+            for entries in (buf.console, buf.page_errors, buf.request_failures, buf.response_errors):
+                entries.clear()
+            buf._navigation_id = navigation_id
+        return buf
+
+    def _on_request(self, page: "Page", request: Any) -> None:
+        navigation_id = self._navigation_ids.get(page)
+        if navigation_id is not None:
+            self._request_scopes[request] = (weakref.ref(page), navigation_id)
+
+    def _request_navigation(self, page: "Page", request: Any) -> str | None:
+        scope = self._request_scopes.get(request)
+        return scope[1] if scope is not None and scope[0]() is page else None
+
+    def _schedule_response(self, session: "BrowserSession", page: "Page", response: "Response") -> None:
+        # Capture synchronously: requestfinished can precede the task's first run.
+        navigation_id = self._request_navigation(page, response.request)
+        if navigation_id is not None:
+            spawn_background_task(self._on_response(session, page, response, navigation_id))
+
     def _on_console(self, session: "BrowserSession", page: "Page", message: Any) -> None:
         entry = {"type": message.type, "text": message.text, "location": message.location}
         self._bounded_append(session.console_messages, entry)
-        _tab_bounded_append(get_buffer(session, tab_id_for(session, page)).console, entry)
+        buf = self._scope_buffer(session, page, self._navigation_ids.get(page))
+        if buf is not None:
+            _tab_bounded_append(buf.console, entry)
 
     def _on_pageerror(self, session: "BrowserSession", page: "Page", error: Any) -> None:
         text = str(error)
         self._bounded_append(session.page_errors, text)
-        _tab_bounded_append(get_buffer(session, tab_id_for(session, page)).page_errors, {"text": text})
+        buf = self._scope_buffer(session, page, self._navigation_ids.get(page))
+        if buf is not None:
+            _tab_bounded_append(buf.page_errors, {"text": text})
 
     def _on_request_failed(self, session: "BrowserSession", page: "Page", request: Any) -> None:
         entry = {
@@ -156,13 +200,21 @@ class BrowserDiagnosticsService:
             "failure": str(request.failure) if request.failure else None,
         }
         self._bounded_append(session.request_failures, entry)
-        _tab_bounded_append(get_buffer(session, tab_id_for(session, page)).request_failures, entry)
+        navigation_id = self._request_navigation(page, request)
+        self._request_scopes.pop(request, None)
+        buf = self._scope_buffer(session, page, navigation_id)
+        if buf is not None:
+            _tab_bounded_append(buf.request_failures, entry)
 
-    async def _on_response(self, session: "BrowserSession", page: "Page", response: "Response") -> None:
+    async def _on_response(
+        self, session: "BrowserSession", page: "Page", response: "Response", navigation_id: str
+    ) -> None:
         """A failed XHR/fetch response (status >= 400): capture its JSON/text
         body, capped and PII-scrubbed -- this is where a site states the real
         reason ("invalid area"), which a bare status code never tells."""
         try:
+            if self._navigation_ids.get(page) != navigation_id:
+                return
             status = response.status
             if status < 400:
                 return
@@ -196,7 +248,10 @@ class BrowserDiagnosticsService:
                 "content_type": content_type,
                 "body": body_snippet,
             }
-            _tab_bounded_append(get_buffer(session, tab_id_for(session, page)).response_errors, entry)
+            # The body read can finish after a navigation, including same-URL reload.
+            buf = self._scope_buffer(session, page, navigation_id)
+            if buf is not None:
+                _tab_bounded_append(buf.response_errors, entry)
         except Exception as exc:
             logger.debug("diagnostics: response capture failed: %s", exc)
 
@@ -223,7 +278,9 @@ class BrowserDiagnosticsService:
         real = unwrap_session(session)
         page = session.page
         tab_id = getattr(session, "tab_id", None) or tab_id_for(real, page)
-        buf = real.tab_diagnostics.get(tab_id)
+        navigation_id = self._navigation_ids.get(page)
+        url = getattr(page, "url", "")
+        buf = self._scope_buffer(real, page, navigation_id)
         console_errors: list[dict[str, Any]] = []
         page_errors: list[Any] = []
         failed_requests: list[dict[str, Any]] = []
@@ -244,15 +301,30 @@ class BrowserDiagnosticsService:
                     )
             except Exception as exc:
                 logger.debug("diagnostics: console scrub failed: %s", exc)
-        validation_messages = await self._validation_messages(page, limit=limit)
+        validation_messages = await self._validation_messages(page, limit=limit) if navigation_id else []
         try:
             title = await page.title()
         except Exception:
             title = ""
+        current = (
+            navigation_id is not None
+            and session.page is page
+            and self._navigation_ids.get(page) == navigation_id
+            and tab_id_for(real, page) == tab_id
+            and getattr(page, "url", "") == url
+        )
+        if not current:
+            return {
+                "url": "", "title": "", "tab_id": tab_id,
+                "navigation_id": None, "scope_status": "changed_or_unobserved",
+                "console_errors": [], "page_errors": [], "failed_requests": [], "validation_messages": [],
+            }
         return {
-            "url": getattr(page, "url", ""),
+            "url": url,
             "title": title,
             "tab_id": tab_id,
+            "navigation_id": navigation_id,
+            "scope_status": "current_navigation",
             "console_errors": console_errors,
             "page_errors": page_errors,
             "failed_requests": failed_requests,

@@ -231,6 +231,22 @@ class DiagnosticsDomQueryRealBrowserTests(unittest.IsolatedAsyncioTestCase):
         messages = [m["message"] for m in result["validation_messages"] if m["kind"] == "role-alert"]
         self.assertIn("invalid area", messages)
 
+    async def test_navigation_removes_previous_document_diagnostics_but_not_legacy_history(self) -> None:
+        tab_id, page = await self._employee_tab("/form")
+        await self._submit_and_wait_for_failure(page)
+        before = await self._diagnostics(tab_id)
+        await page.goto(f"{self.base}/blank")
+        after = await self._diagnostics(tab_id)
+        self.assertEqual(after["scope_status"], "current_navigation")
+        self.assertNotEqual(before["navigation_id"], after["navigation_id"])
+        self.assertTrue(after["url"].endswith("/blank"))
+        for key in ("console_errors", "page_errors", "failed_requests", "validation_messages"):
+            self.assertEqual(after[key], [])
+        self.assertIn("boom load", [entry["text"] for entry in self.session.console_messages])
+        await page.reload()
+        reloaded = await self._diagnostics(tab_id)
+        self.assertNotEqual(after["navigation_id"], reloaded["navigation_id"])
+
     async def test_the_owners_tab_shows_none_of_the_employees_tab_diagnostics(self) -> None:
         tab_id, page = await self._employee_tab("/form")
         await self._submit_and_wait_for_failure(page)
