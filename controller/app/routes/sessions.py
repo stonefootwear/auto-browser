@@ -455,7 +455,13 @@ def create_sessions_router(*, manager: Any) -> APIRouter:
     @router.post("/sessions/{session_id}/actions/dom-query")
     async def dom_query(session_id: str, payload: DomQueryRequest) -> dict[str, Any]:
         try:
-            return await manager.dom_query(session_id, css=payload.css, text=payload.text, limit=payload.limit)
+            return await manager.dom_query(
+                session_id,
+                css=payload.css,
+                text=payload.text,
+                limit=payload.limit,
+                editor_text_limit=payload.editor_text_limit,
+            )
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid request") from None
         except BrowserActionError:

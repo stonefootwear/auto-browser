@@ -309,11 +309,17 @@ class DomQueryRequest(StrictInputModel):
     css: str | None = Field(default=None, min_length=1, max_length=2000)
     text: str | None = Field(default=None, min_length=1, max_length=500)
     limit: int = Field(default=50, ge=1, le=200)
+    # Opt-in because ordinary diagnostics only need the compact 200-character
+    # summary.  A caller binding an approved public write to one live composer
+    # can request the editor's complete text, with explicit truncation metadata.
+    editor_text_limit: int | None = Field(default=None, ge=1, le=4096)
 
     @model_validator(mode="after")
     def validate_query(self) -> "DomQueryRequest":
         if not (self.css or self.text):
             raise ValueError("dom_query requires css and/or text")
+        if self.editor_text_limit is not None and not self.css:
+            raise ValueError("editor_text_limit requires a scoped css selector")
         return self
 
 

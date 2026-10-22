@@ -206,29 +206,59 @@ class BrowserObservationService:
         return list(result.get("keys") or [])
 
     async def dom_query(
-        self, session_id: str, *, css: str | None = None, text: str | None = None, limit: int = 50
+        self,
+        session_id: str,
+        *,
+        css: str | None = None,
+        text: str | None = None,
+        limit: int = 50,
+        editor_text_limit: int | None = None,
     ) -> dict[str, Any]:
         """A compact, capped list of elements matching a CSS selector and/or a
         text filter -- the same "raw view" a developer gets from DevTools'
         element inspector, on any site with no per-site code. Read-only: the
         page only ever runs DOM_QUERY_SCRIPT, parameterised by plain css/text
-        strings, never arbitrary JS from the caller."""
+        strings, never arbitrary JS from the caller.  ``editor_text_limit`` is
+        an opt-in, bounded read of a visible, non-sensitive contenteditable
+        textbox; every requested item says whether that text is complete."""
         session = await self.manager.get_session(session_id)
         limit = max(1, min(int(limit), 200))
+        if editor_text_limit is not None:
+            editor_text_limit = max(1, min(int(editor_text_limit), 4096))
         async with session.lock:
             result = await self.manager.session_lifecycle.guarded(
                 session,
-                self._dom_query_locked(session, css=css, text=text, limit=limit),
+                self._dom_query_locked(
+                    session,
+                    css=css,
+                    text=text,
+                    limit=limit,
+                    editor_text_limit=editor_text_limit,
+                ),
                 what="dom_query",
                 timeout=self.manager.settings.browser_call_timeout_seconds,
             )
         return redact_api_keys(result)
 
     async def _dom_query_locked(
-        self, session: "BrowserSession", *, css: str | None, text: str | None, limit: int
+        self,
+        session: "BrowserSession",
+        *,
+        css: str | None,
+        text: str | None,
+        limit: int,
+        editor_text_limit: int | None,
     ) -> dict[str, Any]:
         try:
-            raw = await session.page.evaluate(DOM_QUERY_SCRIPT, {"css": css, "text": text, "limit": limit})
+            raw = await session.page.evaluate(
+                DOM_QUERY_SCRIPT,
+                {
+                    "css": css,
+                    "text": text,
+                    "limit": limit,
+                    "editor_text_limit": editor_text_limit,
+                },
+            )
         except Exception as exc:
             logger.debug("dom_query failed for session %s: %s", getattr(session, "id", "?"), exc)
             return {"error": "dom_query_failed", "items": [], "total_matched": 0, "url": session.page.url}

@@ -654,11 +654,23 @@ class BrowserManager:
         return await self.diagnostics.get_diagnostics(session_id, limit=limit)
 
     async def dom_query(
-        self, session_id: str, *, css: str | None = None, text: str | None = None, limit: int = 50
+        self,
+        session_id: str,
+        *,
+        css: str | None = None,
+        text: str | None = None,
+        limit: int = 50,
+        editor_text_limit: int | None = None,
     ) -> dict[str, Any]:
         """Read-only CSS/text query over the tab's live DOM -- no JS eval
         exposed to the caller, only a fixed, parameterised scan."""
-        return await self.observation.dom_query(session_id, css=css, text=text, limit=limit)
+        return await self.observation.dom_query(
+            session_id,
+            css=css,
+            text=text,
+            limit=limit,
+            editor_text_limit=editor_text_limit,
+        )
 
     async def get_network_log(
         self,

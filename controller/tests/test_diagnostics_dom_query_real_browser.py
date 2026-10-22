@@ -44,6 +44,8 @@ FORM_PAGE = """<!doctype html>
   <div id="msg" role="alert"></div>
   <button id="submit" type="button" onclick="doSubmit()">Submit</button>
 </form>
+<div id="composer" role="textbox" contenteditable="true" aria-label="Write to Hayat Hassan"></div>
+<div id="secret-editor" role="textbox" contenteditable="true" aria-label="Password"></div>
 <script>
 async function doSubmit() {
   const res = await fetch('/api/submit', {
@@ -287,6 +289,43 @@ class DiagnosticsDomQueryRealBrowserTests(unittest.IsolatedAsyncioTestCase):
 
         owner_view = await self._dom_query(None, css="#msg")
         self.assertEqual(owner_view["items"], [], "the owner's blank page has no #msg")
+
+    async def test_dom_query_reads_one_complete_bound_editor_without_exposing_sensitive_editors(self) -> None:
+        tab_id, page = await self._employee_tab("/form")
+        draft = "رسالة موثوقة 🙂\n" + ("نص طويل للتحقق من المحتوى الكامل. " * 45)
+        secret = "owner-password-value"
+        await page.locator("#composer").evaluate("(el, value) => { el.innerText = value; }", draft)
+        await page.locator("#secret-editor").evaluate("(el, value) => { el.innerText = value; }", secret)
+        actual = await page.locator("#composer").evaluate("el => el.innerText")
+
+        legacy = await self._dom_query(tab_id, css="#composer")
+        self.assertNotIn("editor_text", legacy["items"][0])
+        # Legacy String.slice remains a 200 UTF-16-unit summary; the emoji uses
+        # two units, so Python sees 199 Unicode code points here.
+        self.assertGreaterEqual(len(legacy["items"][0]["text"]), 199)
+
+        result = await self._dom_query(tab_id, css="#composer", editor_text_limit=4096)
+        editor = result["items"][0]["editor_text"]
+        self.assertEqual(editor["text"], actual)
+        self.assertEqual(editor["character_count"], len(actual))
+        self.assertEqual(editor["max_chars"], 4096)
+        self.assertTrue(editor["available"])
+        self.assertTrue(editor["complete"])
+        self.assertFalse(editor["truncated"])
+
+        truncated = await self._dom_query(tab_id, css="#composer", editor_text_limit=200)
+        short_editor = truncated["items"][0]["editor_text"]
+        self.assertEqual(short_editor["character_count"], len(actual))
+        self.assertEqual(len(short_editor["text"]), 200)
+        self.assertFalse(short_editor["complete"])
+        self.assertTrue(short_editor["truncated"])
+
+        protected = await self._dom_query(tab_id, css="#secret-editor", editor_text_limit=4096)
+        protected_item = protected["items"][0]
+        self.assertEqual(protected_item["text"], "")
+        self.assertEqual(protected_item["editor_text"]["reason"], "sensitive_editor")
+        self.assertIsNone(protected_item["editor_text"]["text"])
+        self.assertNotIn(secret, str(protected_item))
 
     async def test_a_failed_click_carries_the_same_digest_the_employee_would_get_from_diagnostics(self) -> None:
         tab_id, page = await self._employee_tab("/form")
