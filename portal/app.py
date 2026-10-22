@@ -200,11 +200,15 @@ const recoveryPanel = document.getElementById("viewer-recovery");
 const recoveryLink = document.getElementById("viewer-recovery-link");
 const csrf = document.body.dataset.csrf || "";
 let reconnectTimer = null;
+let frameLoadWatchdogTimer = null;
 let connectWatchdogTimer = null;
 let reconnectAttempt = 0;
 let statusCheckInFlight = false;
 let reconnectStopped = false;
+let expectedViewerUrl = null;
+let preparedViewerUrl = null;
 const STATUS_TIMEOUT_MS = 8000;
+const FRAME_LOAD_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 10000;
 
 function remoteDocument() {
@@ -236,11 +240,19 @@ function clearConnectWatchdog() {
   connectWatchdogTimer = null;
 }
 
+function clearFrameLoadWatchdog() {
+  if (frameLoadWatchdogTimer !== null) window.clearTimeout(frameLoadWatchdogTimer);
+  frameLoadWatchdogTimer = null;
+}
+
 function stopReconnect(message, href, label) {
   reconnectStopped = true;
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  clearFrameLoadWatchdog();
   clearConnectWatchdog();
+  expectedViewerUrl = null;
+  preparedViewerUrl = null;
   frame.src = "about:blank";
   status.textContent = message;
   status.dataset.state = "closed";
@@ -313,8 +325,11 @@ function syncRemoteStatus(remoteStatus) {
 
 function prepareRemoteViewer() {
   if (reconnectStopped) return;
+  if (expectedViewerUrl === null || frame.src !== expectedViewerUrl) return;
+  if (preparedViewerUrl === expectedViewerUrl) return;
   const doc = remoteDocument();
   if (!doc) {
+    clearFrameLoadWatchdog();
     clearConnectWatchdog();
     scheduleReconnect();
     return;
@@ -322,10 +337,21 @@ function prepareRemoteViewer() {
   const remoteStatus = doc.getElementById("status");
   const remoteScreen = doc.getElementById("screen");
   if (!remoteStatus || !remoteScreen) {
+    clearFrameLoadWatchdog();
     clearConnectWatchdog();
     scheduleReconnect();
     return;
   }
+
+  const loadedViewerUrl = expectedViewerUrl;
+  preparedViewerUrl = loadedViewerUrl;
+  clearFrameLoadWatchdog();
+  clearConnectWatchdog();
+  connectWatchdogTimer = window.setTimeout(() => {
+    connectWatchdogTimer = null;
+    if (expectedViewerUrl !== loadedViewerUrl || preparedViewerUrl !== loadedViewerUrl) return;
+    scheduleReconnect();
+  }, CONNECT_TIMEOUT_MS);
 
   const topBar = doc.getElementById("top_bar");
   if (topBar) topBar.hidden = true;
@@ -356,6 +382,7 @@ function prepareRemoteViewer() {
 
 function connectViewer() {
   if (reconnectStopped) return;
+  clearFrameLoadWatchdog();
   clearConnectWatchdog();
   status.textContent = "جاري الاتصال…";
   status.dataset.state = "connecting";
@@ -363,11 +390,15 @@ function connectViewer() {
   url.searchParams.set("path", "vnc/websockify");
   url.searchParams.set("scale", "true");
   url.searchParams.set("attempt", String(Date.now()));
-  frame.src = url.href;
-  connectWatchdogTimer = window.setTimeout(() => {
-    connectWatchdogTimer = null;
+  const loadingViewerUrl = url.href;
+  expectedViewerUrl = loadingViewerUrl;
+  preparedViewerUrl = null;
+  frame.src = loadingViewerUrl;
+  frameLoadWatchdogTimer = window.setTimeout(() => {
+    frameLoadWatchdogTimer = null;
+    if (expectedViewerUrl !== loadingViewerUrl || preparedViewerUrl === loadingViewerUrl) return;
     scheduleReconnect();
-  }, CONNECT_TIMEOUT_MS);
+  }, FRAME_LOAD_TIMEOUT_MS);
 }
 
 function dispatchWheel(deltaX, deltaY, amplifiedEvents = null) {

@@ -22,6 +22,7 @@ function element() {
 
 function viewer(responses) {
   let nextTimerId = 1;
+  let currentTime = 0;
   const timers = [];
   const observers = [];
   const elements = Object.fromEntries([
@@ -30,12 +31,17 @@ function viewer(responses) {
     "show-keyboard", "hide-keyboard", "fullscreen",
   ].map((name) => [name, element()]));
   const frame = elements["remote-frame"];
-  frame.src = "";
+  let frameSrc = "";
+  frame.srcAssignments = [];
+  Object.defineProperty(frame, "src", {
+    get() { return frameSrc; },
+    set(value) { frameSrc = value; frame.srcAssignments.push(value); },
+  });
   frame.contentDocument = null;
   frame.contentWindow = {focus() {}, WheelEvent: class { static DOM_DELTA_PIXEL = 0; }};
 
   function setTimeoutFake(callback, delay) {
-    const timer = {id: nextTimerId++, callback, delay, cleared: false};
+    const timer = {id: nextTimerId++, callback, delay, due: currentTime + delay, cleared: false};
     timers.push(timer);
     return timer.id;
   }
@@ -85,7 +91,23 @@ function viewer(responses) {
     WeakSet,
   });
   vm.runInContext(source, context);
-  return {elements, frame, timers, observers};
+  return {
+    elements, frame, timers, observers,
+    async advanceBy(elapsed) {
+      const targetTime = currentTime + elapsed;
+      while (true) {
+        const timer = timers
+          .filter((candidate) => !candidate.cleared && candidate.due <= targetTime)
+          .sort((left, right) => left.due - right.due)[0];
+        if (!timer) break;
+        currentTime = timer.due;
+        timer.cleared = true;
+        timer.callback();
+        await settle();
+      }
+      currentTime = targetTime;
+    },
+  };
 }
 
 function activeTimers(state, delay = null) {
@@ -128,7 +150,54 @@ async function runTimer(state, delay) {
   const open = viewer([{status: 200, body: {status: "open"}}]);
   await runTimer(open, 0);
   assert(open.frame.src.includes("/vnc/vnc_lite.html"), "open viewer did not load iframe");
-  assert(activeTimers(open, 10000).length === 1, "connecting viewer has no watchdog");
+  assert(activeTimers(open, 10000).length === 0, "RFB watchdog started before iframe modules loaded");
+  assert(activeTimers(open, 30000).length === 1, "loading viewer has no bounded load watchdog");
+
+  const slow = viewer([{status: 200, body: {status: "open"}}]);
+  await runTimer(slow, 0);
+  const slowSrc = slow.frame.src;
+  assert(activeTimers(slow, 10000).length === 0, "slow iframe was given a premature RFB deadline");
+  await slow.advanceBy(12000);
+  assert(slow.frame.srcAssignments.length === 1, "slow iframe reloaded before its load event");
+  const slowRemoteStatus = {textContent: "Connecting"};
+  const slowRemoteScreen = {style: {}, addEventListener() {}, querySelector() { return null; }};
+  slow.frame.contentDocument = {
+    documentElement: {style: {}}, body: {style: {}},
+    getElementById(name) {
+      if (name === "status") return slowRemoteStatus;
+      if (name === "screen") return slowRemoteScreen;
+      return null;
+    },
+  };
+  slow.frame.listeners.load();
+  assert(activeTimers(slow, 30000).length === 0, "completed iframe kept its load watchdog");
+  assert(activeTimers(slow, 10000).length === 1, "loaded iframe did not start the RFB watchdog");
+  slowRemoteStatus.textContent = "Connected to browser";
+  slow.observers[0]();
+  assert(activeTimers(slow, 10000).length === 0, "connected RFB kept its watchdog");
+  assert(slow.frame.src === slowSrc && slow.frame.srcAssignments.length === 1, "slow successful load replaced the iframe");
+
+  const connectFailure = viewer([
+    {status: 200, body: {status: "open"}},
+    {status: 200, body: {status: "open"}},
+  ]);
+  await runTimer(connectFailure, 0);
+  const failedRemoteStatus = {textContent: "Connecting"};
+  const failedRemoteScreen = {style: {}, addEventListener() {}, querySelector() { return null; }};
+  connectFailure.frame.contentDocument = {
+    documentElement: {style: {}}, body: {style: {}},
+    getElementById(name) {
+      if (name === "status") return failedRemoteStatus;
+      if (name === "screen") return failedRemoteScreen;
+      return null;
+    },
+  };
+  connectFailure.frame.listeners.load();
+  await runTimer(connectFailure, 10000);
+  assert(activeTimers(connectFailure, 1500).length === 1, "post-load RFB timeout did not schedule recovery");
+  await runTimer(connectFailure, 1500);
+  assert(connectFailure.frame.srcAssignments.length === 2, "post-load RFB timeout did not replace the failed iframe");
+  assert(activeTimers(connectFailure, 30000).length === 1, "replacement iframe has no load watchdog");
 
   const stale = viewer([
     {status: 200, body: {status: "open"}},
