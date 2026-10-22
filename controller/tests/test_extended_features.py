@@ -21,15 +21,28 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
 from app import events as _events
 from app.browser.services import BrowserAuthProfileService, BrowserDiagnosticsService
 from app.config import Settings
 from app.models import (
+    DomQueryRequest,
     ImportAuthProfileRequest,
     ObserveRequest,
     ScreenshotDiffResponse,
 )
 from app.webhooks import _sign
+
+
+class TestDomQueryRequest(unittest.TestCase):
+    def test_editor_text_limit_is_opt_in_and_bounded(self) -> None:
+        self.assertIsNone(DomQueryRequest(css="#composer").editor_text_limit)
+        self.assertEqual(DomQueryRequest(css="#composer", editor_text_limit=4096).editor_text_limit, 4096)
+        with self.assertRaises(ValidationError):
+            DomQueryRequest(css="#composer", editor_text_limit=4097)
+        with self.assertRaises(ValidationError):
+            DomQueryRequest(text="draft", editor_text_limit=4096)
 
 # ── Perception Preset Models ─────────────────────────────────────────────────
 

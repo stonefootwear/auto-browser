@@ -849,10 +849,63 @@ DOM_QUERY_SCRIPT = r"""
   const css = args.css || null;
   const needle = (args.text || '').toLowerCase();
   const limit = args.limit || 50;
+  const editorTextLimit = Number.isInteger(args.editor_text_limit)
+    ? Math.max(1, Math.min(args.editor_text_limit, 4096))
+    : null;
   function isVisible(el) {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  }
+  function sensitiveEditor(el) {
+    const inputType = (el.getAttribute('type') || '').trim().toLowerCase();
+    const autocomplete = (el.getAttribute('autocomplete') || '').trim().toLowerCase();
+    if (inputType === 'password') return true;
+    if (['current-password', 'new-password', 'one-time-code'].includes(autocomplete)) return true;
+    const attributes = [
+      inputType,
+      autocomplete,
+      el.getAttribute('name'),
+      el.id,
+      el.getAttribute('placeholder'),
+      el.getAttribute('aria-label'),
+    ].filter(Boolean).join(' ').toLowerCase();
+    return /password|passcode|otp|one[- ]time|verification|token|secret|2fa|mfa/.test(attributes);
+  }
+  function trustedEditorText(el, visible) {
+    if (editorTextLimit === null) return null;
+    const base = {
+      available: false,
+      text: null,
+      character_count: null,
+      max_chars: editorTextLimit,
+      complete: false,
+      truncated: false,
+    };
+    if (!visible || el.closest('[aria-hidden="true"]')) {
+      return {...base, reason: 'not_visible'};
+    }
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    if (role !== 'textbox' || !el.isContentEditable) {
+      return {...base, reason: 'not_trusted_editor'};
+    }
+    if (sensitiveEditor(el)) {
+      return {...base, reason: 'sensitive_editor'};
+    }
+    const raw = String(el.innerText ?? el.textContent ?? '');
+    // Array.from counts Unicode code points and never cuts a surrogate pair in
+    // half, unlike String.length/slice.  This matches the controller's bounded
+    // character contract for Arabic text and emoji as well as ASCII.
+    const characters = Array.from(raw);
+    const truncated = characters.length > editorTextLimit;
+    return {
+      available: true,
+      text: characters.slice(0, editorTextLimit).join(''),
+      character_count: characters.length,
+      max_chars: editorTextLimit,
+      complete: !truncated,
+      truncated,
+    };
   }
   let nodes;
   try {
@@ -867,10 +920,16 @@ DOM_QUERY_SCRIPT = r"""
   const out = [];
   for (const el of nodes) {
     if (out.length >= limit) break;
-    const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    // The opt-in editor read must not accidentally carry a password/OTP value
+    // through the legacy summary field beside the protected editor_text field.
+    const hideSensitiveEditorText = editorTextLimit !== null && sensitiveEditor(el);
+    const t = hideSensitiveEditorText
+      ? ''
+      : (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
     if (needle && !t.toLowerCase().includes(needle)) continue;
     const rect = el.getBoundingClientRect();
-    out.push({
+    const visible = isVisible(el);
+    const item = {
       tag: el.tagName.toLowerCase(),
       role: el.getAttribute('role') || null,
       text: t.slice(0, 200),
@@ -880,12 +939,15 @@ DOM_QUERY_SCRIPT = r"""
       type: el.getAttribute('type') || null,
       href: el.getAttribute('href') || null,
       aria_label: el.getAttribute('aria-label') || null,
-      visible: isVisible(el),
+      visible,
       bbox: {
         x: Math.round(rect.x), y: Math.round(rect.y),
         width: Math.round(rect.width), height: Math.round(rect.height),
       },
-    });
+    };
+    const editorText = trustedEditorText(el, visible);
+    if (editorText !== null) item.editor_text = editorText;
+    out.push(item);
   }
   return { error: null, items: out, total_matched };
 }
