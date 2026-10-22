@@ -207,6 +207,7 @@ let statusCheckInFlight = false;
 let reconnectStopped = false;
 let expectedViewerUrl = null;
 let preparedViewerUrl = null;
+let remoteStatusObserver = null;
 const STATUS_TIMEOUT_MS = 8000;
 const FRAME_LOAD_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 10000;
@@ -245,12 +246,18 @@ function clearFrameLoadWatchdog() {
   frameLoadWatchdogTimer = null;
 }
 
+function clearRemoteStatusObserver() {
+  if (remoteStatusObserver !== null) remoteStatusObserver.disconnect();
+  remoteStatusObserver = null;
+}
+
 function stopReconnect(message, href, label) {
   reconnectStopped = true;
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
   clearFrameLoadWatchdog();
   clearConnectWatchdog();
+  clearRemoteStatusObserver();
   expectedViewerUrl = null;
   preparedViewerUrl = null;
   frame.src = "about:blank";
@@ -334,6 +341,7 @@ function prepareRemoteViewer() {
     scheduleReconnect();
     return;
   }
+  if (doc.URL !== expectedViewerUrl) return;
   const remoteStatus = doc.getElementById("status");
   const remoteScreen = doc.getElementById("screen");
   if (!remoteStatus || !remoteScreen) {
@@ -347,6 +355,7 @@ function prepareRemoteViewer() {
   preparedViewerUrl = loadedViewerUrl;
   clearFrameLoadWatchdog();
   clearConnectWatchdog();
+  clearRemoteStatusObserver();
   connectWatchdogTimer = window.setTimeout(() => {
     connectWatchdogTimer = null;
     if (expectedViewerUrl !== loadedViewerUrl || preparedViewerUrl !== loadedViewerUrl) return;
@@ -372,7 +381,11 @@ function prepareRemoteViewer() {
     dispatchWheel(event.deltaX * 2.5, event.deltaY * 2.5, amplifiedWheelEvents);
   }, {capture: true, passive: false});
 
-  new MutationObserver(() => syncRemoteStatus(remoteStatus)).observe(remoteStatus, {
+  remoteStatusObserver = new MutationObserver(() => {
+    if (reconnectStopped || expectedViewerUrl !== loadedViewerUrl || preparedViewerUrl !== loadedViewerUrl) return;
+    syncRemoteStatus(remoteStatus);
+  });
+  remoteStatusObserver.observe(remoteStatus, {
     childList: true,
     characterData: true,
     subtree: true,
@@ -384,6 +397,7 @@ function connectViewer() {
   if (reconnectStopped) return;
   clearFrameLoadWatchdog();
   clearConnectWatchdog();
+  clearRemoteStatusObserver();
   status.textContent = "جاري الاتصال…";
   status.dataset.state = "connecting";
   const url = new URL("/vnc/vnc_lite.html", window.location.href);
