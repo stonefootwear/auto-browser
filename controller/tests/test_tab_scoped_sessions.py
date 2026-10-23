@@ -448,6 +448,10 @@ class TabViewTests(_ManagerCase):
 
         self.assertIs((await self.view(tab_id)).page, opener)  # mutating lookup keeps fallback
         self.assertIs((await self.manager.get_session("s1")).page, self.owner_page)
+        self.manager.sessions.pop("s1")
+        with self.assertRaises(BrowserActionError) as uninitialized:
+            await self.manager.list_tabs("s1")
+        self.assertEqual((uninitialized.exception.status_code, uninitialized.exception.code), (410, "tab_gone"))
 
     async def test_two_views_on_different_pages_run_concurrently(self) -> None:
         first = await self.open("emad")

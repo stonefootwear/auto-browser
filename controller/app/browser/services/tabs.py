@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from ...action_errors import BrowserActionError
 from ...navigation_policy import await_public_dns_check
 from ..tab_view import (
     TabView,
@@ -29,7 +30,10 @@ class BrowserTabService:
     async def list(self, session_id: str) -> list[dict[str, Any]]:
         session = self.manager.sessions.get(session_id)
         if session is None:
-            raise KeyError(session_id)
+            raise BrowserActionError(
+                "That tab is no longer open. List the tabs or open a new one.",
+                code="tab_gone", status_code=410, retryable=True,
+            )
         # Read-only: the shared side, so the owner's tab strip polling this
         # never waits behind (or holds up) the employees' tab actions.
         async with session.lock.shared():
