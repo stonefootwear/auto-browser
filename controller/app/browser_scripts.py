@@ -100,10 +100,47 @@ STEALTH_INIT_SCRIPT = r"""
 
 INTERACTABLES_SCRIPT = r"""
 (limit) => {
-  function isVisible(el) {
+  function isPainted(el) {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    return rect.width > 0 && rect.height > 0
+      && rect.right > 0 && rect.bottom > 0
+      && rect.left < window.innerWidth && rect.top < window.innerHeight
+      && style.visibility !== 'hidden' && style.display !== 'none'
+      && style.opacity !== '0' && !el.closest('[aria-hidden="true"]');
+  }
+
+  function isHitTestable(el) {
+    if (!isPainted(el)) return false;
+    const rect = el.getBoundingClientRect();
+    const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    const hit = document.elementFromPoint(x, y);
+    return Boolean(hit && (hit === el || el.contains(hit)));
+  }
+
+  function activeDialog() {
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open]')]
+      .filter(isHitTestable);
+    if (!dialogs.length) return null;
+    const leaves = dialogs.filter((candidate) =>
+      !dialogs.some((other) => other !== candidate && candidate.contains(other))
+    );
+    const candidates = leaves.length ? leaves : dialogs;
+    const depth = (el) => {
+      let value = 0;
+      for (let node = el; node && node !== document.body; node = node.parentElement) value += 1;
+      return value;
+    };
+    candidates.sort((left, right) => {
+      const depthDelta = depth(left) - depth(right);
+      if (depthDelta) return depthDelta;
+      const leftZ = Number.parseInt(window.getComputedStyle(left).zIndex, 10) || 0;
+      const rightZ = Number.parseInt(window.getComputedStyle(right).zIndex, 10) || 0;
+      if (leftZ !== rightZ) return leftZ - rightZ;
+      return left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+    });
+    return candidates[candidates.length - 1];
   }
 
   // An input's live value is never a label: for a password / one-time-code / any text
@@ -115,7 +152,17 @@ INTERACTABLES_SCRIPT = r"""
   }
 
   function getLabel(el) {
+    const labelledBy = (el.getAttribute('aria-labelledby') || '')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || '')
+      .join(' ');
+    const associatedLabels = el.labels
+      ? [...el.labels].map((label) => label.innerText || label.textContent || '').join(' ')
+      : '';
     const raw = el.getAttribute('aria-label')
+      || labelledBy
+      || associatedLabels
       || el.getAttribute('placeholder')
       || el.innerText
       || buttonValue(el)
@@ -135,14 +182,23 @@ INTERACTABLES_SCRIPT = r"""
     '[role="button"]',
     '[role="link"]',
     '[role="textbox"]',
+    '[role="checkbox"]',
+    '[role="radio"]',
+    '[role="switch"]',
     '[contenteditable="true"]',
     '[tabindex]'
   ].join(',');
 
   const out = [];
   const seen = new Set();
-  for (const el of document.querySelectorAll(selector)) {
-    if (!isVisible(el) || el.closest('[aria-hidden="true"]')) continue;
+  const dialog = activeDialog();
+  const root = dialog || document;
+  const controls = [
+    ...(root.matches?.(selector) ? [root] : []),
+    ...root.querySelectorAll(selector),
+  ];
+  for (const el of controls) {
+    if (!isHitTestable(el)) continue;
     if (!el.dataset.operatorId) {
       el.dataset.operatorId = `op-${Math.random().toString(36).slice(2, 10)}`;
     }
@@ -156,7 +212,12 @@ INTERACTABLES_SCRIPT = r"""
       role: el.getAttribute('role') || el.tagName.toLowerCase(),
       label: getLabel(el),
       disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+      checked: ['checkbox', 'radio'].includes((el.getAttribute('type') || '').toLowerCase())
+        ? Boolean(el.checked)
+        : (el.hasAttribute('aria-checked') ? el.getAttribute('aria-checked') === 'true' : null),
       href: el.href || null,
+      in_active_dialog: Boolean(dialog),
+      dialog_label: dialog ? getLabel(dialog) : null,
       bbox: {
         x: Math.round(rect.x),
         y: Math.round(rect.y),
@@ -190,16 +251,14 @@ INTERACTABLES_SCRIPT = r"""
   function optionContainers() {
     const containers = new Set();
     for (const el of document.querySelectorAll('[role="listbox"], [role="menu"], [role="tree"], [role="grid"]')) {
-      if (isVisible(el)) containers.add(el);
+      if (isPainted(el) && (!dialog || dialog.contains(el) || isHitTestable(el))) containers.add(el);
     }
-    for (const el of document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open]')) {
-      if (isVisible(el)) containers.add(el);
-    }
+    if (dialog) containers.add(dialog);
     // A portal-rendered dropdown: a fixed/absolute panel appended as a direct
     // child of <body>, holding several pointer-cursor rows, with no ARIA
     // role of its own.
     for (const el of document.body.children) {
-      if (containers.has(el) || !isVisible(el) || el.closest('[aria-hidden="true"]')) continue;
+      if (containers.has(el) || !isPainted(el)) continue;
       let position = '';
       try { position = window.getComputedStyle(el).position; } catch (_) {}
       if (position !== 'fixed' && position !== 'absolute') continue;
@@ -218,7 +277,8 @@ INTERACTABLES_SCRIPT = r"""
     );
     const candidates = items.length ? [...items] : [...container.querySelectorAll('*')].filter(isOptionLike);
     for (const el of candidates) {
-      if (seen.has(el) || !isVisible(el)) continue;
+      if (out.length >= limit) break outer;
+      if (seen.has(el) || !isHitTestable(el)) continue;
       seen.add(el);
       if (!el.dataset.operatorId) {
         el.dataset.operatorId = `op-${Math.random().toString(36).slice(2, 10)}`;
@@ -232,7 +292,10 @@ INTERACTABLES_SCRIPT = r"""
         role: el.getAttribute('role') || 'option',
         label: getLabel(el),
         disabled: Boolean(el.getAttribute('aria-disabled') === 'true'),
+        checked: el.hasAttribute('aria-checked') ? el.getAttribute('aria-checked') === 'true' : null,
         href: null,
+        in_active_dialog: Boolean(dialog && dialog.contains(el)),
+        dialog_label: dialog ? getLabel(dialog) : null,
         bbox: {
           x: Math.round(rect.x),
           y: Math.round(rect.y),
@@ -242,11 +305,27 @@ INTERACTABLES_SCRIPT = r"""
         list_option: true
       });
       optionCount += 1;
-      if (optionCount >= OPTION_CAP) break outer;
+      if (optionCount >= OPTION_CAP || out.length >= limit) break outer;
     }
   }
 
-  return out;
+  let dialogSummary = null;
+  if (dialog) {
+    if (!dialog.dataset.operatorId) {
+      dialog.dataset.operatorId = `op-${Math.random().toString(36).slice(2, 10)}`;
+    }
+    const rect = dialog.getBoundingClientRect();
+    dialogSummary = {
+      element_id: dialog.dataset.operatorId,
+      label: getLabel(dialog),
+      role: dialog.getAttribute('role') || 'dialog',
+      bbox: {
+        x: Math.round(rect.x), y: Math.round(rect.y),
+        width: Math.round(rect.width), height: Math.round(rect.height)
+      }
+    };
+  }
+  return {interactables: out, active_dialog: dialogSummary};
 }
 """
 
@@ -852,10 +931,63 @@ DOM_QUERY_SCRIPT = r"""
   const editorTextLimit = Number.isInteger(args.editor_text_limit)
     ? Math.max(1, Math.min(args.editor_text_limit, 4096))
     : null;
-  function isVisible(el) {
+  function isPainted(el) {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    return rect.width > 0 && rect.height > 0
+      && rect.right > 0 && rect.bottom > 0
+      && rect.left < window.innerWidth && rect.top < window.innerHeight
+      && style.visibility !== 'hidden' && style.display !== 'none'
+      && style.opacity !== '0' && !el.closest('[aria-hidden="true"]');
+  }
+  function isVisible(el) {
+    if (!isPainted(el)) return false;
+    const rect = el.getBoundingClientRect();
+    const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    const hit = document.elementFromPoint(x, y);
+    return Boolean(hit && (hit === el || el.contains(hit)));
+  }
+  function activeDialog() {
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open]')]
+      .filter(isVisible);
+    if (!dialogs.length) return null;
+    const leaves = dialogs.filter((candidate) =>
+      !dialogs.some((other) => other !== candidate && candidate.contains(other))
+    );
+    const candidates = leaves.length ? leaves : dialogs;
+    const depth = (el) => {
+      let value = 0;
+      for (let node = el; node && node !== document.body; node = node.parentElement) value += 1;
+      return value;
+    };
+    candidates.sort((left, right) => {
+      const depthDelta = depth(left) - depth(right);
+      if (depthDelta) return depthDelta;
+      const leftZ = Number.parseInt(window.getComputedStyle(left).zIndex, 10) || 0;
+      const rightZ = Number.parseInt(window.getComputedStyle(right).zIndex, 10) || 0;
+      if (leftZ !== rightZ) return leftZ - rightZ;
+      return left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+    });
+    return candidates[candidates.length - 1];
+  }
+  function buttonValue(el) {
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    return el.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(type) ? el.value : '';
+  }
+  function accessibleName(el) {
+    const labelledBy = (el.getAttribute('aria-labelledby') || '')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || '')
+      .join(' ');
+    const associatedLabels = el.labels
+      ? [...el.labels].map((label) => label.innerText || label.textContent || '').join(' ')
+      : '';
+    const raw = el.getAttribute('aria-label') || labelledBy || associatedLabels
+      || el.getAttribute('placeholder') || el.innerText || buttonValue(el)
+      || el.getAttribute('name') || el.id || el.href || '';
+    return String(raw).replace(/\s+/g, ' ').trim().slice(0, 160);
   }
   function sensitiveEditor(el) {
     const inputType = (el.getAttribute('type') || '').trim().toLowerCase();
@@ -914,6 +1046,7 @@ DOM_QUERY_SCRIPT = r"""
     return { error: 'invalid_selector', items: [], total_matched: 0 };
   }
   const total_matched = nodes.length;
+  const dialog = activeDialog();
   // A huge page must not be scanned node-by-node in full -- cap the scan,
   // not just the result, before the text filter runs.
   nodes = nodes.slice(0, 2000);
@@ -929,9 +1062,14 @@ DOM_QUERY_SCRIPT = r"""
     if (needle && !t.toLowerCase().includes(needle)) continue;
     const rect = el.getBoundingClientRect();
     const visible = isVisible(el);
+    if (!el.dataset.operatorId) {
+      el.dataset.operatorId = `op-${Math.random().toString(36).slice(2, 10)}`;
+    }
     const item = {
+      element_id: el.dataset.operatorId,
       tag: el.tagName.toLowerCase(),
       role: el.getAttribute('role') || null,
+      label: accessibleName(el),
       text: t.slice(0, 200),
       id: el.id || null,
       name: el.getAttribute('name') || null,
@@ -940,6 +1078,12 @@ DOM_QUERY_SCRIPT = r"""
       href: el.getAttribute('href') || null,
       aria_label: el.getAttribute('aria-label') || null,
       visible,
+      disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+      checked: ['checkbox', 'radio'].includes((el.getAttribute('type') || '').toLowerCase())
+        ? Boolean(el.checked)
+        : (el.hasAttribute('aria-checked') ? el.getAttribute('aria-checked') === 'true' : null),
+      in_active_dialog: Boolean(dialog && (dialog === el || dialog.contains(el))),
+      dialog_label: dialog ? accessibleName(dialog) : null,
       bbox: {
         x: Math.round(rect.x), y: Math.round(rect.y),
         width: Math.round(rect.width), height: Math.round(rect.height),
