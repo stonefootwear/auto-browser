@@ -373,10 +373,9 @@ class BrowserObservationService:
             logger.warning("unknown perception preset %r; falling back to 'normal'", preset)
             preset = "normal"
 
-        # Document coordinates only; nested-container wheel movement is not proved here.
-        scroll_position = await session.page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
-
         if preset == "fast":
+            # Fast observations skip the DOM summary used by the other presets.
+            scroll_position = await session.page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
             screenshot = await self._capture_screenshot_redacted(session, screenshot_label)
             title = await session.page.title()
             tabs = await self.manager.tabs.summaries(session)
@@ -417,7 +416,7 @@ class BrowserObservationService:
             return {
                 "session": await self.manager._session_summary(session),
                 "url": session.page.url,
-                "scroll_position": scroll_position,
+                "scroll_position": summary.get("scroll_position"),
                 "title": summary["title"],
                 "active_element": summary["active_element"],
                 "text_excerpt": summary["text_excerpt"],
@@ -455,7 +454,7 @@ class BrowserObservationService:
         return {
             "session": await self.manager._session_summary(session),
             "url": session.page.url,
-            "scroll_position": scroll_position,
+            "scroll_position": summary.get("scroll_position"),
             "title": summary["title"],
             "active_element": summary["active_element"],
             "text_excerpt": summary["text_excerpt"],
@@ -522,6 +521,7 @@ class BrowserObservationService:
         summary = await self.page_summary(session.page)
         return {
             "url": session.page.url,
+            "scroll_position": summary.get("scroll_position"),
             "title": summary["title"],
             "active_element": summary["active_element"],
             "text_excerpt": summary["text_excerpt"],
@@ -551,6 +551,8 @@ class BrowserObservationService:
         summary = await page.evaluate(PAGE_SUMMARY_SCRIPT, text_limit)
         accessibility_outline = await self.accessibility_outline(page)
         return {
+            # Document movement only, captured in the existing summary evaluation.
+            "scroll_position": summary.get("scroll_position"),
             "title": await page.title(),
             "active_element": await page.evaluate(ACTIVE_ELEMENT_SCRIPT),
             "text_excerpt": summary.get("text_excerpt", ""),
