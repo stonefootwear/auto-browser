@@ -1329,8 +1329,8 @@ class BrowserSessionService:
                 manager._attach_page_listeners(replacement, session)
 
             if active and replacement is not None:
-                if created_replacement:
-                    _transfer_tab_identity(session, page, replacement)
+                # A different physical page cannot inherit the crashed page's
+                # tab id or owner, even when recovery creates the replacement.
                 session.page = replacement
                 manager._attach_page_listeners(replacement, session)
                 bring_to_front = getattr(replacement, "bring_to_front", None)
@@ -1985,15 +1985,3 @@ def _page_url(page: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _transfer_tab_identity(session: Any, old_page: Any, new_page: Any) -> None:
-    """Keep a tab-scoped grant bound to its replacement, never another tab."""
-    old_tab_id = session.tab_ids.pop(old_page, None)
-    if old_tab_id is None:
-        return
-    previous = session.tab_ids.pop(new_page, None)
-    if previous is not None and previous != old_tab_id:
-        session.tab_owners.pop(previous, None)
-    session.tab_ids[new_page] = old_tab_id
-    old_lock = session.page_locks.pop(old_page, None)
-    if old_lock is not None:
-        session.page_locks[new_page] = old_lock

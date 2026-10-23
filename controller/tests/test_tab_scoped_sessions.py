@@ -10,7 +10,7 @@ import weakref
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -23,8 +23,10 @@ from app.browser.tab_view import (
     TabView,
     bind_tab,
     page_for_tab,
+    set_tab_owner,
     tab_id_for,
     tab_last_action_at,
+    tab_owner,
     unwrap_session,
 )
 from app.browser_manager import BrowserManager, BrowserSession
@@ -463,6 +465,46 @@ class TabViewTests(_ManagerCase):
         self.manager.dialogs.heal_active_page = heal_active_page
         self.assertIs((await self.view(tab_id)).page, opener)  # mutating lookup keeps fallback
         self.assertIs((await self.manager.get_session("s1")).page, self.owner_page)
+
+        # Renderer repair may choose a new physical page, but that page must
+        # not acquire the crashed tab's logical id or employee ownership.
+        crashed = FakePage(self.context, "https://crashed.example.com/", "Crashed")
+        self.context.pages = [crashed]
+        self.session.page = crashed
+        crashed_id = tab_id_for(self.session, crashed)
+        set_tab_owner(self.session, crashed_id, "emad")
+        self.session.crashed_pages[crashed] = "Target crashed"
+        self.session.pending_crashed_pages.add(crashed)
+
+        async def new_page() -> FakePage:
+            replacement = FakePage(self.context, "about:blank", "Replacement")
+            replacement.set_default_timeout = Mock()  # type: ignore[attr-defined]
+            self.context.pages.append(replacement)
+            return replacement
+
+        self.context.new_page = new_page  # type: ignore[method-assign]
+        self.manager.audit.append = AsyncMock()  # type: ignore[method-assign]
+        self.manager.session_lifecycle.persist = AsyncMock()  # type: ignore[method-assign]
+        with patch("app.browser.services.sessions.session_connection_problem", return_value=None):
+            self.assertTrue(
+                await self.manager.session_lifecycle.recover_crashed_page(
+                    self.session, crashed, reason="Target crashed"
+                )
+            )
+        replacement = self.session.page
+        replacement_id = tab_id_for(self.session, replacement)
+        self.assertNotEqual(replacement_id, crashed_id)
+        self.assertIsNone(tab_owner(self.session, replacement_id))
+        token = current_tab_id.set(crashed_id)
+        try:
+            with self.assertRaises(BrowserActionError) as repaired_gone:
+                await self.manager.get_session("s1", read_only=True)
+            self.assertEqual(
+                (repaired_gone.exception.status_code, repaired_gone.exception.code), (410, "tab_gone")
+            )
+        finally:
+            current_tab_id.reset(token)
+
         self.manager.sessions.pop("s1")
         with self.assertRaises(BrowserActionError) as uninitialized:
             await self.manager.list_tabs("s1")
