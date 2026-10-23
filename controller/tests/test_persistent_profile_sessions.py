@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -11,6 +13,7 @@ from app.audit import reset_current_operator, set_current_operator
 from app.browser.services.runtime import PersistentProfileAttachment
 from app.browser_manager import BrowserManager
 from app.config import Settings
+from app.models import SessionRecord
 from app.persistent_profiles import PersistentProfileError, PersistentProfileHandle
 
 
@@ -40,8 +43,10 @@ def _settings(root: Path, **overrides) -> Settings:
 
 
 class FakePage:
-    def __init__(self, url: str = "about:blank") -> None:
+    def __init__(self, url: str = "about:blank", *, target_id: str | None = None) -> None:
         self.url = url
+        self.target_id = target_id or f"target-{id(self)}"
+        self.context = None
         self.on = unittest.mock.Mock()
         self.set_default_timeout = unittest.mock.Mock()
         self.goto = AsyncMock(side_effect=self._goto)
@@ -59,21 +64,38 @@ class FakePage:
 class FakePersistentContext:
     def __init__(self, pages: list[FakePage] | None = None) -> None:
         self.pages = pages if pages is not None else []
+        for page in self.pages:
+            page.context = self
         self.on = unittest.mock.Mock()
         self.close = AsyncMock()
         self.tracing = unittest.mock.Mock()
         self.tracing.start = AsyncMock()
         self.tracing.stop = AsyncMock()
         self._new_page = FakePage()
+        self.cdp_session_count = 0
         self.storage_state = AsyncMock(return_value={"cookies": [], "origins": []})
 
     async def new_page(self) -> FakePage:
+        self._new_page.context = self
         self.pages.append(self._new_page)
         return self._new_page
 
+    async def new_cdp_session(self, page: FakePage):
+        self.cdp_session_count += 1
+        class _Cdp:
+            async def send(self, method: str):
+                assert method == "Target.getTargetInfo"
+                return {"targetInfo": {"targetId": page.target_id}}
+
+            async def detach(self):
+                return None
+
+        return _Cdp()
+
 
 class FakeCdpBrowser:
-    def __init__(self) -> None:
+    def __init__(self, context: FakePersistentContext) -> None:
+        self.contexts = [context]
         self.close = AsyncMock()
 
 
@@ -117,13 +139,22 @@ class _Base(unittest.IsolatedAsyncioTestCase):
                 session.auto_persist_task.cancel()
         self.tmp.cleanup()
 
-    async def _fake_open(self, name, *, owner=None, adopt_unmarked=False, context_kwargs=None, storage_state=None):
+    async def _fake_open(
+        self,
+        name,
+        *,
+        owner=None,
+        adopt_unmarked=False,
+        context_kwargs=None,
+        storage_state=None,
+        reattach_only=False,
+    ):
         await asyncio.sleep(0.01)  # a real launch awaits; lets concurrent Opens interleave
         return _handle(name, **self.handle_kwargs)
 
     async def _fake_attach(self, handle):
         context = FakePersistentContext(list(self.context_pages) if self.context_pages is not None else [])
-        browser = FakeCdpBrowser()
+        browser = FakeCdpBrowser(context)
         self.contexts.append(context)
         self.browsers.append(browser)
         return PersistentProfileAttachment(browser=browser, context=context, handle=handle)
@@ -208,6 +239,18 @@ class PersistentProfileSessionCreateTests(_Base):
         result = await self.manager.create_session(name="fixture")
         self.assertIs(self.manager.sessions[result["id"]].page, existing_tab)
 
+    async def test_already_open_profile_preserves_existing_page_instead_of_navigating(self) -> None:
+        existing_tab = FakePage(url="https://example.com/already-open")
+        self.context_pages = [existing_tab]
+        self.handle_kwargs = {"already_open": True, "was_empty": False}
+
+        result = await self.manager.create_session(
+            name="fixture", start_url="https://example.com/default-start"
+        )
+
+        self.assertIs(self.manager.sessions[result["id"]].page, existing_tab)
+        existing_tab.goto.assert_not_awaited()
+
     async def test_profile_without_tabs_gets_a_new_page_and_is_never_traced(self) -> None:
         # The persistent context is the owner's own live browser: no
         # screencast/DOM-snapshot trace of it, even with ENABLE_TRACING on.
@@ -225,6 +268,130 @@ class PersistentProfileSessionCreateTests(_Base):
         self.manager.settings.stealth_enabled = True
         await self.manager.create_session(name="fixture")
         self.contexts[0]._new_page.add_init_script.assert_not_awaited()
+
+
+class PersistentProfileStartupRestoreTests(_Base):
+    @staticmethod
+    def _digest(target_id: str) -> str:
+        return hashlib.sha256(target_id.encode("utf-8")).hexdigest()
+
+    def _record(self, tabs: list[dict], *, active: str, include_capsule: bool = True) -> SessionRecord:
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        payload = {
+            "id": "existing1234",
+            "name": "owner",
+            "created_at": now,
+            "updated_at": now,
+            "status": "active",
+            "live": True,
+            "current_url": "",
+            "title": "",
+            "artifact_dir": str(self.root / "artifacts/existing1234"),
+            "takeover_url": "",
+            "remote_access": {},
+        }
+        if include_capsule:
+            payload["persistent_recovery"] = {
+                "version": 1,
+                "profile_name": "owner-default",
+                "profile_owner": "alice",
+                "active_target_digest": active,
+                "tabs": tabs,
+            }
+        return SessionRecord.model_validate(payload)
+
+    async def test_exact_capsule_restores_ids_owners_and_active_page_without_navigation(self) -> None:
+        first = FakePage("https://example.com/one", target_id="stable-one")
+        second = FakePage("https://example.com/two", target_id="stable-two")
+        self.context_pages = [first, second]
+        self.handle_kwargs = {"already_open": True, "was_empty": False}
+        self.manager._persist_session = self.manager.session_lifecycle.persist
+        first_digest = self._digest("stable-one")
+        second_digest = self._digest("stable-two")
+        record = self._record(
+            [
+                {"target_digest": first_digest, "tab_id": "t-111111111111", "owner": "nihad"},
+                {"target_digest": second_digest, "tab_id": "t-222222222222", "owner": "nihad"},
+            ],
+            active=second_digest,
+        )
+
+        await self.manager.session_lifecycle.restore_startup_session([record])
+
+        session = self.manager.sessions[record.id]
+        self.assertIs(session.page, second)
+        self.assertEqual(session.tab_ids[first], "t-111111111111")
+        self.assertEqual(session.tab_ids[second], "t-222222222222")
+        self.assertEqual(session.tab_owners, {"t-111111111111": "nihad", "t-222222222222": "nihad"})
+        first.goto.assert_not_awaited()
+        second.goto.assert_not_awaited()
+        self.assertTrue(self.manager.persistent_profiles.open.await_args.kwargs["reattach_only"])
+        persisted = self.manager.session_store.upsert.await_args.args[0]
+        self.assertEqual(persisted.persistent_recovery.active_target_digest, second_digest)
+
+    async def test_persistence_reuses_page_target_digest_but_rebuilds_current_page_set(self) -> None:
+        first = FakePage("https://example.com/one", target_id="stable-one")
+        self.context_pages = [first]
+        result = await self.manager.create_session(name="fixture")
+        session = self.manager.sessions[result["id"]]
+        self.manager._persist_session = self.manager.session_lifecycle.persist
+
+        await self.manager._persist_session(session, status="active")
+        await self.manager._persist_session(session, status="active")
+        second = FakePage("https://example.com/two", target_id="stable-two")
+        second.context = session.context
+        session.context.pages.append(second)
+        await self.manager._persist_session(session, status="active")
+
+        self.assertEqual(session.context.cdp_session_count, 2)
+        persisted = self.manager.session_store.upsert.await_args.args[0]
+        self.assertEqual(len(persisted.persistent_recovery.tabs), 2)
+
+    async def test_legacy_or_duplicate_capsule_is_refused_before_profile_open(self) -> None:
+        digest = self._digest("same-target")
+        legacy = self._record([], active=digest, include_capsule=False)
+        duplicate = self._record(
+            [
+                {"target_digest": digest, "tab_id": "t-111111111111", "owner": None},
+                {"target_digest": digest, "tab_id": "t-222222222222", "owner": None},
+            ],
+            active=digest,
+        )
+
+        await self.manager.session_lifecycle.restore_startup_session([legacy])
+        await self.manager.session_lifecycle.restore_startup_session([duplicate])
+
+        self.assertEqual(self.manager.sessions, {})
+        self.manager.persistent_profiles.open.assert_not_awaited()
+
+    async def test_recovery_capsule_is_not_exposed_by_session_listing(self) -> None:
+        digest = self._digest("private-target")
+        record = self._record(
+            [{"target_digest": digest, "tab_id": "t-111111111111", "owner": "nihad"}],
+            active=digest,
+        )
+        self.manager.session_store.list = AsyncMock(return_value=[record])
+
+        [listed] = await self.manager.session_lifecycle.list()
+
+        self.assertNotIn("persistent_recovery", listed)
+
+    async def test_wrong_current_target_disconnects_only_and_leaves_profile_running(self) -> None:
+        current = FakePage("https://example.com/current", target_id="current-target")
+        self.context_pages = [current]
+        self.handle_kwargs = {"already_open": True, "was_empty": False}
+        expected = self._digest("different-target")
+        record = self._record(
+            [{"target_digest": expected, "tab_id": "t-111111111111", "owner": None}],
+            active=expected,
+        )
+
+        await self.manager.session_lifecycle.restore_startup_session([record])
+
+        self.assertEqual(self.manager.sessions, {})
+        self.browsers[0].close.assert_awaited_once()
+        self.manager.persistent_profiles.close.assert_not_awaited()
+        current.goto.assert_not_awaited()
 
 
 class DeniedRememberedLoginTests(_Base):
