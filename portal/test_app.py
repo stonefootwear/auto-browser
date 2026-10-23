@@ -44,7 +44,7 @@ class Upstreams:
         self.saved_profiles: set[str] = set()
         self.novnc_calls: list[str] = []
         self.typed_text: list[str] = []
-        self.activated_tabs: list[int] = []
+        self.activated_tabs: list[dict] = []
 
     def identity(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else {}
@@ -133,8 +133,8 @@ class Upstreams:
                 {"index": "bad"},
             ])
         if request.method == "POST" and request.url.path == "/owner/sessions/browser-1/tabs/activate":
-            self.activated_tabs.append(body["index"])
-            return httpx.Response(200, json={"index": body["index"]})
+            self.activated_tabs.append(body)
+            return httpx.Response(200, json=body)
         if request.method in ("GET", "HEAD") and request.url.path.startswith("/owner/vnc/"):
             self.novnc_calls.append(request.url.path.removeprefix("/owner/vnc"))
             if not self.active:
@@ -1137,6 +1137,7 @@ def test_tab_strip_lists_who_works_where_and_shows_a_tab_on_the_owners_tap(tmp_p
         assert "autoFollowEnabled" in script.text and "last_action_at" in script.text
         assert "MANUAL_COOLDOWN_MS" in script.text and "MIN_GAP_MS" in script.text
         assert "localStorage" in script.text
+        assert "tab_id: tab.tab_id" in script.text
 
         tabs = client.get("/api/browser/tabs")
         assert tabs.status_code == 200
@@ -1155,17 +1156,22 @@ def test_tab_strip_lists_who_works_where_and_shows_a_tab_on_the_owners_tap(tmp_p
                            json={"index": 1}).status_code == 403
         assert client.post("/api/browser/tabs/activate", headers=mutate(csrf), json={"index": -1}).status_code == 422
         assert client.post("/api/browser/tabs/activate", headers=mutate(csrf), json={"index": True}).status_code == 422
+        assert client.post("/api/browser/tabs/activate", headers=mutate(csrf),
+                           json={"index": 1, "tab_id": "bad"}).status_code == 422
+        assert client.post("/api/browser/tabs/activate", headers=mutate(csrf),
+                           json={"index": 1, "tab_id": None}).status_code == 422
         assert upstreams.activated_tabs == []
-        shown = client.post("/api/browser/tabs/activate", headers=mutate(csrf), json={"index": 1})
+        shown = client.post("/api/browser/tabs/activate", headers=mutate(csrf),
+                            json={"index": 1, "tab_id": "t-bbbbbbbbbbbb"})
         assert shown.status_code == 200 and shown.json() == {"status": "shown", "index": 1}
-        assert upstreams.activated_tabs == [1]
+        assert upstreams.activated_tabs == [{"index": 1, "tab_id": "t-bbbbbbbbbbbb"}]
 
         # Another identity never sees or switches this owner's tabs.
         client.cookies.clear()
         second_csrf = login(client, "second@example.com", "222222")
         assert client.get("/api/browser/tabs").status_code == 403
         assert client.post("/api/browser/tabs/activate", headers=mutate(second_csrf), json={"index": 0}).status_code == 403
-        assert upstreams.activated_tabs == [1]
+        assert upstreams.activated_tabs == [{"index": 1, "tab_id": "t-bbbbbbbbbbbb"}]
 
 
 def test_novnc_static_files_are_cached_after_one_gated_fetch_but_vnc_html_never_is(tmp_path, clock, upstreams):

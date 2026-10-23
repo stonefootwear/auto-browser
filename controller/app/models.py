@@ -270,6 +270,10 @@ class TabIndexRequest(StrictInputModel):
     index: int = Field(ge=0)
 
 
+class ActivateTabRequest(TabIndexRequest):
+    tab_id: str | None = Field(default=None, pattern=r"^t-[0-9a-f]{12}$")
+
+
 class OpenTabRequest(StrictInputModel):
     url: str | None = Field(default=None, min_length=1, max_length=2000)
     activate: bool = True
