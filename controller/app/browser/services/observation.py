@@ -387,6 +387,7 @@ class BrowserObservationService:
                 "accessibility_outline": {"available": False, "nodes": []},
                 "ocr": None,
                 "interactables": [],
+                "active_dialog": None,
                 "screenshot_path": screenshot["path"],
                 "screenshot_url": screenshot["url"],
                 "console_messages": session.console_messages[-10:],
@@ -400,7 +401,13 @@ class BrowserObservationService:
             }
 
         if preset == "text":
-            interactables = await session.page.evaluate(INTERACTABLES_SCRIPT, limit)
+            interactable_snapshot = await session.page.evaluate(INTERACTABLES_SCRIPT, limit)
+            if isinstance(interactable_snapshot, dict):
+                interactables = interactable_snapshot.get("interactables") or []
+                active_dialog = interactable_snapshot.get("active_dialog")
+            else:  # compatibility with a pre-change page script in test doubles
+                interactables = interactable_snapshot or []
+                active_dialog = None
             summary = await self.page_summary(session.page, text_limit=2000)
             tabs = await self.manager.tabs.summaries(session)
             return {
@@ -413,6 +420,7 @@ class BrowserObservationService:
                 "accessibility_outline": summary["accessibility_outline"],
                 "ocr": None,
                 "interactables": interactables,
+                "active_dialog": active_dialog,
                 "screenshot_path": None,
                 "screenshot_url": None,
                 "console_messages": session.console_messages[-10:],
@@ -427,7 +435,13 @@ class BrowserObservationService:
 
         screenshot = await self.manager._capture_screenshot(session, screenshot_label)
         effective_limit = min(limit * 2, 200) if preset == "rich" else limit
-        interactables = await session.page.evaluate(INTERACTABLES_SCRIPT, effective_limit)
+        interactable_snapshot = await session.page.evaluate(INTERACTABLES_SCRIPT, effective_limit)
+        if isinstance(interactable_snapshot, dict):
+            interactables = interactable_snapshot.get("interactables") or []
+            active_dialog = interactable_snapshot.get("active_dialog")
+        else:  # compatibility with a pre-change page script in test doubles
+            interactables = interactable_snapshot or []
+            active_dialog = None
         text_limit = 4000 if preset == "rich" else 2000
         summary = await self.page_summary(session.page, text_limit=text_limit)
         ocr = await self._extract_ocr_if_needed(session, screenshot, summary)
@@ -443,6 +457,7 @@ class BrowserObservationService:
             "accessibility_outline": summary["accessibility_outline"],
             "ocr": ocr,
             "interactables": interactables,
+            "active_dialog": active_dialog,
             "screenshot_path": screenshot["path"],
             "screenshot_url": screenshot["url"],
             "console_messages": session.console_messages[-10:],

@@ -62,7 +62,28 @@ async function doSubmit() {
 </script>
 </body></html>"""
 
-PAGES = {"/form": FORM_PAGE, "/blank": "<!doctype html><html><body>nothing here</body></html>"}
+MODAL_PAGE = """<!doctype html>
+<html><head><title>participation review</title></head>
+<body style="margin:0">
+  <button id="underlay" aria-label="Post comment">Post comment</button>
+  <div role="dialog" aria-label="Post details"
+       style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:10">
+    <div role="dialog" aria-modal="true" aria-labelledby="review-title"
+         style="position:absolute;left:200px;top:80px;width:420px;height:420px;background:white;z-index:20;padding:20px">
+      <h2 id="review-title">Participation review</h2>
+      <input id="join" type="checkbox" checked><label for="join">Join the public group</label>
+      <input id="agree" type="checkbox"><label for="agree">I agree to the group rules</label>
+      <button id="submit-review" disabled>Submit</button>
+      <button id="offscreen" style="position:absolute;top:900px">Offscreen modal action</button>
+    </div>
+  </div>
+</body></html>"""
+
+PAGES = {
+    "/form": FORM_PAGE,
+    "/modal": MODAL_PAGE,
+    "/blank": "<!doctype html><html><body>nothing here</body></html>",
+}
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -206,6 +227,13 @@ class DiagnosticsDomQueryRealBrowserTests(unittest.IsolatedAsyncioTestCase):
         finally:
             current_tab_id.reset(token)
 
+    async def _observe(self, tab_id: str, **kwargs) -> dict:
+        token = current_tab_id.set(tab_id)
+        try:
+            return await self.manager.observe(self.session.id, **kwargs)
+        finally:
+            current_tab_id.reset(token)
+
     def test_diagnostics_route_honours_x_tab_id(self) -> None:
         self.assertTrue(is_tab_scoped_path("GET", "/sessions/abc/diagnostics"))
         self.assertTrue(is_tab_scoped_path("POST", "/sessions/abc/actions/dom-query"))
@@ -289,6 +317,38 @@ class DiagnosticsDomQueryRealBrowserTests(unittest.IsolatedAsyncioTestCase):
 
         owner_view = await self._dom_query(None, css="#msg")
         self.assertEqual(owner_view["items"], [], "the owner's blank page has no #msg")
+
+    async def test_observe_prioritises_the_deepest_active_dialog_and_accessible_controls(self) -> None:
+        tab_id, _page = await self._employee_tab("/modal")
+
+        result = await self._observe(tab_id, preset="text", limit=4)
+
+        self.assertEqual(result["active_dialog"]["label"], "Participation review")
+        by_label = {item["label"]: item for item in result["interactables"]}
+        self.assertNotIn("Post comment", by_label)
+        self.assertNotIn("Offscreen modal action", by_label)
+        self.assertFalse(by_label["I agree to the group rules"]["checked"])
+        self.assertTrue(by_label["Join the public group"]["checked"])
+        self.assertTrue(by_label["Submit"]["disabled"])
+        self.assertTrue(all(item["in_active_dialog"] for item in result["interactables"]))
+
+    async def test_dom_query_exposes_bound_modal_identity_without_calling_underlay_visible(self) -> None:
+        tab_id, _page = await self._employee_tab("/modal")
+
+        controls = await self._dom_query(
+            tab_id,
+            css=(
+                ':is(button,input,[role="button"],[role="checkbox"],'
+                '[role="radio"],[role="switch"],[tabindex])'
+            ),
+        )
+
+        by_label = {item["label"]: item for item in controls["items"]}
+        agree = by_label["I agree to the group rules"]
+        self.assertTrue(agree["in_active_dialog"])
+        self.assertFalse(agree["checked"])
+        self.assertRegex(agree["element_id"], r"^op-[a-z0-9]{4,40}$")
+        self.assertFalse(by_label["Post comment"]["visible"])
 
     async def test_dom_query_reads_one_complete_bound_editor_without_exposing_sensitive_editors(self) -> None:
         tab_id, page = await self._employee_tab("/form")
