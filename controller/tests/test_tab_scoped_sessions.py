@@ -420,6 +420,7 @@ class TabViewTests(_ManagerCase):
             return_value={"url": popup.url, "title": "Sign in", "screenshot_url": None}
         )
         self.manager.dialogs.open_dialog = AsyncMock(return_value=None)
+        heal_active_page = self.manager.dialogs.heal_active_page
         self.manager.dialogs.heal_active_page = Mock()
 
         token = current_tab_id.set(tab_id)
@@ -459,6 +460,7 @@ class TabViewTests(_ManagerCase):
             await self.manager.get_session("s1", read_only=True)
         self.assertEqual((active_gone.exception.status_code, active_gone.exception.code), (410, "tab_gone"))
 
+        self.manager.dialogs.heal_active_page = heal_active_page
         self.assertIs((await self.view(tab_id)).page, opener)  # mutating lookup keeps fallback
         self.assertIs((await self.manager.get_session("s1")).page, self.owner_page)
         self.manager.sessions.pop("s1")
