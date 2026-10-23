@@ -373,6 +373,9 @@ class BrowserObservationService:
             logger.warning("unknown perception preset %r; falling back to 'normal'", preset)
             preset = "normal"
 
+        # Document coordinates only; nested-container wheel movement is not proved here.
+        scroll_position = await session.page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+
         if preset == "fast":
             screenshot = await self._capture_screenshot_redacted(session, screenshot_label)
             title = await session.page.title()
@@ -380,6 +383,7 @@ class BrowserObservationService:
             return {
                 "session": await self.manager._session_summary(session),
                 "url": session.page.url,
+                "scroll_position": scroll_position,
                 "title": title,
                 "active_element": None,
                 "text_excerpt": "",
@@ -413,6 +417,7 @@ class BrowserObservationService:
             return {
                 "session": await self.manager._session_summary(session),
                 "url": session.page.url,
+                "scroll_position": scroll_position,
                 "title": summary["title"],
                 "active_element": summary["active_element"],
                 "text_excerpt": summary["text_excerpt"],
@@ -450,6 +455,7 @@ class BrowserObservationService:
         return {
             "session": await self.manager._session_summary(session),
             "url": session.page.url,
+            "scroll_position": scroll_position,
             "title": summary["title"],
             "active_element": summary["active_element"],
             "text_excerpt": summary["text_excerpt"],

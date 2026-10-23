@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import re
 from typing import TYPE_CHECKING, Any
@@ -1351,15 +1352,28 @@ class BrowserActionService:
         elif target_seen_after is False:
             signals.append("target_no_longer_visible")
 
+        # Require two observed, finite document positions, never requested wheel deltas.
+        before_scroll, after_scroll = before.get("scroll_position"), after.get("scroll_position")
+        scroll_observed = all(
+            isinstance(position, dict)
+            and all(type(position.get(axis)) in (int, float) and math.isfinite(position[axis]) for axis in ("x", "y"))
+            for position in (before_scroll, after_scroll)
+        )
+        if action_name == "scroll" and scroll_observed and any(
+            before_scroll[axis] != after_scroll[axis] for axis in ("x", "y")
+        ):
+            signals.append("scroll_position_changed")
+
         verified = bool(signals)
         if action_name == "navigate":
             verified = "url_changed" in signals or "title_changed" in signals
         elif action_name in {"go_back", "go_forward"}:
             verified = "url_changed" in signals or "title_changed" in signals
+        elif action_name == "scroll":
+            verified = "scroll_position_changed" in signals
         elif action_name in {
             "click",
             "press",
-            "scroll",
         }:
             verified = bool(
                 {
