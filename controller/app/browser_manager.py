@@ -158,6 +158,9 @@ class BrowserSession:
     # page, who opened it (an employee label, None = the owner / unowned),
     # a lock per page for tab-scoped calls, and a mouse position per page.
     tab_ids: "weakref.WeakKeyDictionary[Any, str]" = field(default_factory=weakref.WeakKeyDictionary)
+    # CDP target IDs are immutable for a Page wrapper. Cache only their digest;
+    # persistence still rebuilds the exact current page set on every write.
+    tab_target_digests: "weakref.WeakKeyDictionary[Any, str]" = field(default_factory=weakref.WeakKeyDictionary)
     tab_owners: dict[str, str] = field(default_factory=dict)
     page_locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = field(default_factory=weakref.WeakKeyDictionary)
     page_mouse_positions: "weakref.WeakKeyDictionary[Any, Any]" = field(default_factory=weakref.WeakKeyDictionary)

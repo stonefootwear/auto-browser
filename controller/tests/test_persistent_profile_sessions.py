@@ -72,6 +72,7 @@ class FakePersistentContext:
         self.tracing.start = AsyncMock()
         self.tracing.stop = AsyncMock()
         self._new_page = FakePage()
+        self.cdp_session_count = 0
         self.storage_state = AsyncMock(return_value={"cookies": [], "origins": []})
 
     async def new_page(self) -> FakePage:
@@ -80,6 +81,7 @@ class FakePersistentContext:
         return self._new_page
 
     async def new_cdp_session(self, page: FakePage):
+        self.cdp_session_count += 1
         class _Cdp:
             async def send(self, method: str):
                 assert method == "Target.getTargetInfo"
@@ -326,6 +328,24 @@ class PersistentProfileStartupRestoreTests(_Base):
         self.assertTrue(self.manager.persistent_profiles.open.await_args.kwargs["reattach_only"])
         persisted = self.manager.session_store.upsert.await_args.args[0]
         self.assertEqual(persisted.persistent_recovery.active_target_digest, second_digest)
+
+    async def test_persistence_reuses_page_target_digest_but_rebuilds_current_page_set(self) -> None:
+        first = FakePage("https://example.com/one", target_id="stable-one")
+        self.context_pages = [first]
+        result = await self.manager.create_session(name="fixture")
+        session = self.manager.sessions[result["id"]]
+        self.manager._persist_session = self.manager.session_lifecycle.persist
+
+        await self.manager._persist_session(session, status="active")
+        await self.manager._persist_session(session, status="active")
+        second = FakePage("https://example.com/two", target_id="stable-two")
+        second.context = session.context
+        session.context.pages.append(second)
+        await self.manager._persist_session(session, status="active")
+
+        self.assertEqual(session.context.cdp_session_count, 2)
+        persisted = self.manager.session_store.upsert.await_args.args[0]
+        self.assertEqual(len(persisted.persistent_recovery.tabs), 2)
 
     async def test_legacy_or_duplicate_capsule_is_refused_before_profile_open(self) -> None:
         digest = self._digest("same-target")

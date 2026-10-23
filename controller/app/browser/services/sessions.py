@@ -873,6 +873,7 @@ class BrowserSessionService:
                 by_target = {item.target_digest: item for item in recovery.tabs}
                 for target_digest, page in current.items():
                     item = by_target[target_digest]
+                    session.tab_target_digests[page] = target_digest
                     session.tab_ids[page] = item.tab_id
                     set_tab_owner(session, item.tab_id, item.owner)
                     manager._attach_page_listeners(page, session)
@@ -1836,10 +1837,19 @@ class BrowserSessionService:
             raise RuntimeError("browser target identity is unavailable")
         return hashlib.sha256(target.encode("utf-8")).hexdigest()
 
-    async def _target_pages(self, pages: list[Any]) -> dict[str, Any]:
+    async def _target_pages(
+        self,
+        pages: list[Any],
+        *,
+        session: "BrowserSession | None" = None,
+    ) -> dict[str, Any]:
         targets: dict[str, Any] = {}
         for page in pages:
-            digest = await self._target_digest(page)
+            digest = session.tab_target_digests.get(page) if session is not None else None
+            if digest is None:
+                digest = await self._target_digest(page)
+                if session is not None:
+                    session.tab_target_digests[page] = digest
             if digest in targets:
                 raise RuntimeError("duplicate browser target identity")
             targets[digest] = page
@@ -1847,7 +1857,7 @@ class BrowserSessionService:
 
     async def _recovery_capsule(self, session: "BrowserSession") -> dict[str, Any]:
         pages = _context_pages(session.context)
-        targets = await self._target_pages(pages)
+        targets = await self._target_pages(pages, session=session)
         active_digest = next((digest for digest, page in targets.items() if page is session.page), None)
         if active_digest is None:
             raise RuntimeError("active page is absent from persistent context")
