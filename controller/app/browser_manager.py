@@ -161,6 +161,7 @@ class BrowserSession:
     tab_owners: dict[str, str] = field(default_factory=dict)
     page_locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = field(default_factory=weakref.WeakKeyDictionary)
     page_mouse_positions: "weakref.WeakKeyDictionary[Any, Any]" = field(default_factory=weakref.WeakKeyDictionary)
+    tab_checkpoint_task: "asyncio.Task[None] | None" = None
     # "Remember me": which profile this session's login state is silently kept
     # in sync with (see Settings.auto_persist_*), and the background task doing
     # the periodic re-save. Seeded from auth_profile_name at session creation
@@ -355,6 +356,7 @@ class BrowserManager:
         if self.settings.witness_enabled:
             await self.witness_remote.startup()
         await self.session_store.startup()
+        active_records = [record for record in await self.session_store.list() if record.status == "active"]
         await self.session_store.mark_all_active_interrupted()
         if self.memory is not None:
             await self.memory.startup()
@@ -367,6 +369,7 @@ class BrowserManager:
         # demand (see session_lifecycle.create / persistent_profiles.py).
         if self.settings.session_isolation_mode == "shared_browser_node" and not self.settings.persistent_profiles_enabled:
             await self.ensure_browser()
+        await self.session_lifecycle.restore_startup_session(active_records)
         if self.settings.session_watchdog_interval_seconds > 0:
             self._session_watchdog_task = asyncio.create_task(self._session_watchdog_loop())
 
@@ -698,8 +701,11 @@ class BrowserManager:
         return self.pii_scrubber.summary()
 
     def _attach_page_listeners(self, page: Page, session: BrowserSession) -> None:
+        first_attachment = page not in session.attached_pages
         self.diagnostics.attach_page_listeners(page, session)
         self.session_lifecycle.attach_page_crash_listener(page, session)
+        if first_attachment and hasattr(page, "on"):
+            page.on("close", lambda _page=None: self.session_lifecycle.schedule_tab_checkpoint(session))
 
     async def handle_dialog(
         self, session_id: str, *, accept: bool, prompt_text: str | None = None

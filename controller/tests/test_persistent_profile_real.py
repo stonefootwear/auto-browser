@@ -98,8 +98,8 @@ class RealBrowserNodeTests(unittest.IsolatedAsyncioTestCase):
         self.manager = self._make_manager()
         await self.manager.startup()
 
-    def _make_manager(self, **overrides) -> BrowserManager:
-        root = Path(tempfile.mkdtemp(prefix="real-ctl-", dir=self.tmp))
+    def _make_manager(self, *, root: Path | None = None, **overrides) -> BrowserManager:
+        root = root or Path(tempfile.mkdtemp(prefix="real-ctl-", dir=self.tmp))
         self.root = root
         settings = dict(
                 _env_file=None,
@@ -184,6 +184,42 @@ class RealBrowserNodeTests(unittest.IsolatedAsyncioTestCase):
         await denied_session.page.goto(f"http://{LAN}:{CONTROL_PORT}/healthz")
         self.assertIsNone(await denied_session.page.evaluate("() => localStorage.getItem('k')"))
         await manager.close_session(denied["id"])
+
+    async def test_controller_restart_restores_exact_tabs_owners_and_active_target(self) -> None:
+        manager = self.manager
+        base_url = f"http://{LAN}:{CONTROL_PORT}/healthz"
+        opened = await manager.create_session(name="owner", start_url=base_url)
+        session = manager.sessions[opened["id"]]
+        await manager.open_tab(session.id, f"{base_url}?one", False, owner="nihad")
+        await manager.open_tab(session.id, f"{base_url}?two", True, owner="nihad")
+        before = await manager.list_tabs(session.id)
+        active_before = next(item for item in before if item["active"])
+        browser_pids = await self._process_ids(session.browser, "browser")
+
+        # Simulate the controller container being killed: stop only its
+        # Playwright client and background task. browser-node and Chromium stay.
+        if manager._session_watchdog_task is not None:
+            manager._session_watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await manager._session_watchdog_task
+            manager._session_watchdog_task = None
+        await manager.playwright.stop()
+        manager.playwright = None
+
+        replacement = self._make_manager(root=self.root)
+        self.manager = replacement
+        await replacement.startup()
+
+        self.assertEqual(set(replacement.sessions), {session.id})
+        restored = replacement.sessions[session.id]
+        after = await replacement.list_tabs(session.id)
+        self.assertEqual(
+            {(item["tab_id"], item["owner"], item["url"]) for item in after},
+            {(item["tab_id"], item["owner"], item["url"]) for item in before},
+        )
+        self.assertEqual(next(item for item in after if item["active"])["tab_id"], active_before["tab_id"])
+        self.assertEqual(await self._process_ids(restored.browser, "browser"), browser_pids)
+        await replacement.close_session(session.id)
 
     async def test_open_racing_a_close_gets_a_live_browser(self) -> None:
         """Re-review finding 1, against the real server: Open fired while the

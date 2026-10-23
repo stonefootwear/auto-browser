@@ -90,7 +90,7 @@ def create_session_diagnostics_router(*, manager: Any, settings: Any) -> APIRout
                 session_info = await manager._session_summary(session)
             else:
                 record = await manager.session_store.get(safe_session_id)
-                session_info = record.model_dump()
+                session_info = record.model_dump(exclude={"persistent_recovery"})
         except Exception:
             logger.debug("failed to load replay session info for session %s", safe_session_id, exc_info=True)
             pass

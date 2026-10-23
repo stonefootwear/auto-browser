@@ -591,6 +591,20 @@ class AgentJobCheckpoint(BaseModel):
     error: str | None = None
 
 
+class PersistentTabRecovery(BaseModel):
+    target_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tab_id: str = Field(pattern=r"^t-[0-9a-f]{12}$")
+    owner: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+class PersistentSessionRecovery(BaseModel):
+    version: Literal[1] = 1
+    profile_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
+    profile_owner: str | None = Field(default=None, max_length=320)
+    active_target_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tabs: list[PersistentTabRecovery] = Field(min_length=1, max_length=256)
+
+
 class SessionRecord(BaseModel):
     id: str
     name: str
@@ -613,6 +627,9 @@ class SessionRecord(BaseModel):
     witness_remote: WitnessRemoteState = Field(default_factory=WitnessRemoteState)
     remembered_login_loaded: bool = False
     remembered_login_error: str | None = None
+    # Server-only identity capsule for restoring an already-running persistent
+    # profile after a controller replacement. It contains no URLs or page text.
+    persistent_recovery: PersistentSessionRecovery | None = None
 
 
 class AgentJobRecord(BaseModel):

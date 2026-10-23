@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import time
@@ -15,9 +16,17 @@ from ...browser_scripts import apply_stealth
 from ...models import SessionRecord, SessionStatus
 from ...navigation_policy import await_public_dns_check
 from ...network_inspector import NetworkInspector
-from ...utils import UTC
+from ...utils import UTC, spawn_background_task
 from ..tab_scope import current_tab_id, detached_context
-from ..tab_view import TabView, mark_tab_activity, page_for_tab, unwrap_session
+from ..tab_view import (
+    TabView,
+    mark_tab_activity,
+    page_for_tab,
+    set_tab_owner,
+    tab_id_for,
+    tab_owner,
+    unwrap_session,
+)
 from .connection_health import (
     DRIVER_EXITED,
     is_driver_dead_error,
@@ -50,7 +59,10 @@ class BrowserSessionService:
         # the broker/portal trust this list to decide whether Open/Connect may
         # proceed. Recover (re-attach) or retire such sessions first.
         await self.reap_dead_sessions()
-        session_map = {record.id: record.model_dump() for record in await self.manager.session_store.list()}
+        session_map = {
+            record.id: record.model_dump(exclude={"persistent_recovery"})
+            for record in await self.manager.session_store.list()
+        }
         for session in self.manager.sessions.values():
             summary = await self.manager._session_summary(session)
             session_map[summary["id"]] = summary
@@ -432,8 +444,10 @@ class BrowserSessionService:
                 # re-attached after a controller restart keeps its tabs):
                 # adopt the most recent one instead of piling on another.
                 page = context.pages[-1]
+                preserve_existing_page = persistent_handle.already_open
             else:
                 page = await context.new_page()
+                preserve_existing_page = False
 
             page.set_default_timeout(self.manager.settings.action_timeout_ms)
             # A persistent profile is a real, consistent headed Chromium:
@@ -493,8 +507,7 @@ class BrowserSessionService:
             # track -- otherwise a dialog on the owner's other tab is auto-dismissed.
             for existing in _context_pages(context):
                 self.manager._attach_page_listeners(existing, session)
-            if hasattr(context, "on"):
-                context.on("page", lambda popup: self.manager._attach_page_listeners(popup, session))
+            self.attach_context_page_listener(context, session)
 
             if self.manager.settings.network_inspector_enabled:
                 inspector = NetworkInspector(
@@ -514,7 +527,7 @@ class BrowserSessionService:
                 except Exception as exc:
                     logger.warning("session created hook failed for %s: %s", session_id, exc)
 
-            if start_url:
+            if start_url and not preserve_existing_page:
                 await page.goto(start_url, wait_until="domcontentloaded")
                 await self.manager._settle(page)
 
@@ -766,7 +779,119 @@ class BrowserSessionService:
         if session is not None:
             return await self.manager._session_summary(session)
         record = await self.manager.session_store.get(session_id)
-        return record.model_dump()
+        return record.model_dump(exclude={"persistent_recovery"})
+
+    async def restore_startup_session(self, active_records: list[SessionRecord]) -> None:
+        """Restore one exact persistent session without launching or navigating.
+
+        Startup first marks every former live record interrupted. Only an
+        exact, server-issued target capsule can turn one back into a live
+        session. Legacy records and ambiguous active records stay interrupted.
+        """
+        manager = self.manager
+        if not (
+            manager.settings.persistent_profiles_enabled
+            and manager.settings.session_isolation_mode == "shared_browser_node"
+        ):
+            return
+        candidates = [record for record in active_records if record.persistent_recovery is not None]
+        if len(active_records) != 1 or len(candidates) != 1:
+            if active_records:
+                logger.warning("startup session restore refused: active record set is ambiguous or legacy")
+            return
+        record = candidates[0]
+        recovery = record.persistent_recovery
+        assert recovery is not None
+        stored_targets = [item.target_digest for item in recovery.tabs]
+        stored_tab_ids = [item.tab_id for item in recovery.tabs]
+        if (
+            len(set(stored_targets)) != len(stored_targets)
+            or len(set(stored_tab_ids)) != len(stored_tab_ids)
+            or recovery.active_target_digest not in set(stored_targets)
+        ):
+            logger.warning("startup session restore refused for %s: invalid recovery capsule", record.id)
+            return
+
+        browser = None
+        async with self._profile_lease_lock(recovery.profile_name):
+            try:
+                handle = await manager.persistent_profiles.open(
+                    recovery.profile_name,
+                    owner=recovery.profile_owner,
+                    reattach_only=True,
+                )
+                if not handle.already_open:
+                    raise RuntimeError("persistent profile was not already open")
+                attachment = await manager.runtime.attach_persistent_context(handle)
+                browser = attachment.browser
+                contexts = list(getattr(browser, "contexts", []))
+                if len(contexts) != 1 or contexts[0] is not attachment.context:
+                    raise RuntimeError("persistent profile exposed an ambiguous context set")
+                context = attachment.context
+                pages = _context_pages(context)
+                if not pages:
+                    raise RuntimeError("persistent profile exposed no pages")
+                current = await self._target_pages(pages)
+                if len(current) != len(pages) or set(current) != set(stored_targets):
+                    raise RuntimeError("persistent page targets no longer match the recovery capsule")
+                active_page = current.get(recovery.active_target_digest)
+                if active_page is None:
+                    raise RuntimeError("active persistent page target is missing")
+
+                from ...browser_manager import BrowserSession
+
+                artifact_dir, auth_dir, upload_dir = self.prepare_dirs(record.id)
+                created_at = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
+                session = BrowserSession(
+                    id=record.id,
+                    name=record.name,
+                    created_at=created_at,
+                    context=context,
+                    page=active_page,
+                    artifact_dir=artifact_dir,
+                    auth_dir=auth_dir,
+                    upload_dir=upload_dir,
+                    takeover_url=record.takeover_url or manager.settings.takeover_url,
+                    trace_path=artifact_dir / "trace.zip",
+                    browser=browser,
+                    isolation_mode=manager.settings.session_isolation_mode,
+                    shared_takeover_surface=True,
+                    shared_browser_process=True,
+                    max_live_sessions_per_browser_node=1,
+                    downloads=list(record.downloads),
+                    last_action=record.last_action,
+                    proxy_persona=record.proxy_persona,
+                    protection_mode=record.protection_mode,
+                    witness_remote_state=record.witness_remote,
+                    remembered_login_loaded=record.remembered_login_loaded,
+                    remembered_login_error=record.remembered_login_error,
+                    persistent_profile_name=recovery.profile_name,
+                    persistent_profile_generation=handle.generation,
+                    persistent_open_options={"owner": recovery.profile_owner},
+                    driver_epoch=manager._driver_epoch,
+                )
+                by_target = {item.target_digest: item for item in recovery.tabs}
+                for target_digest, page in current.items():
+                    item = by_target[target_digest]
+                    session.tab_ids[page] = item.tab_id
+                    set_tab_owner(session, item.tab_id, item.owner)
+                    manager._attach_page_listeners(page, session)
+                    page.set_default_timeout(manager.settings.action_timeout_ms)
+                self.attach_context_page_listener(context, session)
+                manager.sessions[session.id] = session
+                if manager._session_created_hook is not None:
+                    try:
+                        await manager._session_created_hook(session.id, active_page)
+                    except Exception as exc:
+                        logger.warning("session created hook failed for restored %s: %s", session.id, exc)
+                await self.persist(session, status="active")
+                logger.info("restored persistent browser session %s without navigation", session.id)
+            except Exception as exc:
+                manager.sessions.pop(record.id, None)
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                logger.warning("startup session restore refused for %s: %s", record.id, exc)
 
     async def close(self, session_id: str) -> dict[str, Any]:
         session = await self.manager.get_session(session_id)
@@ -817,6 +942,11 @@ class BrowserSessionService:
                     if session.runtime is not None:
                         await self.manager.runtime_provisioner.release(session.runtime)
             self.manager.sessions.pop(session_id, None)
+            if session.tab_checkpoint_task is not None and not session.tab_checkpoint_task.done():
+                session.tab_checkpoint_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await session.tab_checkpoint_task
+                session.tab_checkpoint_task = None
             if self.manager._session_closed_hook is not None:
                 try:
                     await self.manager._session_closed_hook(session_id)
@@ -1390,8 +1520,7 @@ class BrowserSessionService:
         manager._attach_page_listeners(page, session)
         for existing in _context_pages(context):
             manager._attach_page_listeners(existing, session)
-        if hasattr(context, "on"):
-            context.on("page", lambda popup: manager._attach_page_listeners(popup, session))
+        self.attach_context_page_listener(context, session)
         logger.warning(
             "session %s: re-attached to persistent profile '%s' (%s, generation %s)",
             session.id,
@@ -1662,7 +1791,84 @@ class BrowserSessionService:
             status=status,
             live=status == "active",
         )
+        if status == "active" and session.persistent_profile_name:
+            summary["persistent_recovery"] = await self._recovery_capsule(session)
         await self.manager.session_store.upsert(SessionRecord.model_validate(summary))
+
+    def attach_context_page_listener(self, context: Any, session: "BrowserSession") -> None:
+        if hasattr(context, "on"):
+            context.on("page", lambda page: self._on_context_page(session, page))
+
+    def _on_context_page(self, session: "BrowserSession", page: Any) -> None:
+        self.manager._attach_page_listeners(page, session)
+        self.schedule_tab_checkpoint(session)
+
+    def schedule_tab_checkpoint(self, session: "BrowserSession") -> None:
+        task = session.tab_checkpoint_task
+        if task is None or task.done():
+            session.tab_checkpoint_task = spawn_background_task(self._checkpoint_tabs(session))
+
+    async def _checkpoint_tabs(self, session: "BrowserSession") -> None:
+        # Page events can fire while an action holds the session lock. Queue
+        # behind it rather than re-entering the lock from the callback.
+        await asyncio.sleep(0)
+        async with session.lock:
+            if self.manager.sessions.get(session.id) is not session or session.persistent_profile_released:
+                return
+            try:
+                dialogs = getattr(self.manager, "dialogs", None)
+                if dialogs is not None:
+                    dialogs.heal_active_page(session)
+                await self.persist(session, status="active")
+            except Exception as exc:
+                logger.warning("failed to checkpoint tab mutation for session %s: %s", session.id, exc)
+
+    @staticmethod
+    async def _target_digest(page: Any) -> str:
+        context = page.context
+        cdp = await context.new_cdp_session(page)
+        try:
+            payload = await cdp.send("Target.getTargetInfo")
+        finally:
+            await cdp.detach()
+        target = payload.get("targetInfo", {}).get("targetId") if isinstance(payload, dict) else None
+        if not isinstance(target, str) or not target:
+            raise RuntimeError("browser target identity is unavailable")
+        return hashlib.sha256(target.encode("utf-8")).hexdigest()
+
+    async def _target_pages(self, pages: list[Any]) -> dict[str, Any]:
+        targets: dict[str, Any] = {}
+        for page in pages:
+            digest = await self._target_digest(page)
+            if digest in targets:
+                raise RuntimeError("duplicate browser target identity")
+            targets[digest] = page
+        return targets
+
+    async def _recovery_capsule(self, session: "BrowserSession") -> dict[str, Any]:
+        pages = _context_pages(session.context)
+        targets = await self._target_pages(pages)
+        active_digest = next((digest for digest, page in targets.items() if page is session.page), None)
+        if active_digest is None:
+            raise RuntimeError("active page is absent from persistent context")
+        tabs = []
+        for digest, page in targets.items():
+            tab_id = tab_id_for(session, page)
+            tabs.append(
+                {
+                    "target_digest": digest,
+                    "tab_id": tab_id,
+                    "owner": tab_owner(session, tab_id),
+                }
+            )
+        options = session.persistent_open_options or {}
+        return {
+            "version": 1,
+            "profile_name": session.persistent_profile_name,
+            "profile_owner": options.get("owner"),
+            "active_target_digest": active_digest,
+            "tabs": tabs,
+        }
 
     def isolation_payload(self, session: "BrowserSession") -> dict[str, Any]:
         payload: dict[str, Any] = {
