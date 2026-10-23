@@ -20,6 +20,7 @@ from ...utils import UTC, spawn_background_task
 from ..tab_scope import current_tab_id, detached_context
 from ..tab_view import (
     TabView,
+    _is_closed,
     mark_tab_activity,
     page_for_tab,
     set_tab_owner,
@@ -733,7 +734,7 @@ class BrowserSessionService:
             except Exception as exc:
                 logger.warning("failed to release isolated runtime during create_session rollback: %s", exc)
 
-    async def get(self, session_id: str) -> "BrowserSession":
+    async def get(self, session_id: str, *, read_only: bool = False) -> "BrowserSession":
         session = self.manager.sessions.get(session_id)
         if session is None:
             raise KeyError(session_id)
@@ -741,11 +742,18 @@ class BrowserSessionService:
         if tab_id is not None:
             # A tab-scoped request (X-Tab-Id): hand back that one tab. The
             # owner's active tab is not healed or touched from here.
-            view = self.tab_view(session, tab_id)
+            view = self.tab_view(session, tab_id, read_only=read_only)
             # Balcony auto-follow reads this to know which employee tab just
             # did something; only a resolved, still-open tab counts.
             mark_tab_activity(session, tab_id)
             return view
+        if read_only:
+            if _is_closed(session.page):
+                raise BrowserActionError(
+                    "That tab is no longer open. List the tabs or open a new one.",
+                    code="tab_gone", status_code=410, retryable=True,
+                )
+            return session
         # The active tab may have closed on its own (an OAuth popup closing
         # after sign-in): go back to the tab that opened it before anyone acts.
         dialogs = getattr(self.manager, "dialogs", None)
@@ -756,13 +764,13 @@ class BrowserSessionService:
                 logger.debug("session %s: active-tab heal failed: %s", session_id, exc)
         return session
 
-    def tab_view(self, session: "BrowserSession", tab_id: str) -> TabView:
+    def tab_view(self, session: "BrowserSession", tab_id: str, *, read_only: bool = False) -> TabView:
         """``session`` seen through tab ``tab_id``; 410 ``tab_gone`` if it closed."""
         try:
             pages = self.manager.tabs.pages(session)
         except Exception:
             pages = []
-        page = page_for_tab(session, tab_id, pages)
+        page = page_for_tab(session, tab_id, pages, read_only=read_only)
         if page is None:
             raise BrowserActionError(
                 "That tab is no longer open. List the tabs or open a new one.",

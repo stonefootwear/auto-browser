@@ -120,7 +120,7 @@ class BrowserObservationService:
         self.manager = manager
 
     async def observe(self, session_id: str, limit: int = 40, preset: str | None = None) -> dict[str, Any]:
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             result = await self.manager.session_lifecycle.guarded(
                 session,
@@ -152,7 +152,7 @@ class BrowserObservationService:
         pattern = API_KEY_PATTERNS.get(provider)
         if pattern is None:
             raise ValueError("unknown provider")
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             found, source = await self.manager.session_lifecycle.guarded(
                 session,
@@ -221,7 +221,7 @@ class BrowserObservationService:
         strings, never arbitrary JS from the caller.  ``editor_text_limit`` is
         an opt-in, bounded read of a visible, non-sensitive contenteditable
         textbox; every requested item says whether that text is complete."""
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         limit = max(1, min(int(limit), 200))
         if editor_text_limit is not None:
             editor_text_limit = max(1, min(int(editor_text_limit), 4096))
@@ -270,7 +270,7 @@ class BrowserObservationService:
         return raw
 
     async def capture_screenshot(self, session_id: str, *, label: str = "manual") -> dict[str, Any]:
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             screenshot = await self.manager.session_lifecycle.guarded(
                 session,

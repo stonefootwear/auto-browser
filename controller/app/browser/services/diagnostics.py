@@ -48,7 +48,7 @@ class BrowserDiagnosticsService:
         self._request_scopes: weakref.WeakKeyDictionary[Any, tuple[Any, str]] = weakref.WeakKeyDictionary()
 
     async def get_console_messages(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             messages = session.console_messages[-limit:]
             if self.pii_scrubber.console_enabled:
@@ -67,7 +67,7 @@ class BrowserDiagnosticsService:
             }
 
     async def get_page_errors(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             return {
                 "session": await self.manager._session_summary(session),
@@ -75,7 +75,7 @@ class BrowserDiagnosticsService:
             }
 
     async def get_request_failures(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             return {
                 "session": await self.manager._session_summary(session),
@@ -90,7 +90,7 @@ class BrowserDiagnosticsService:
         method: str | None = None,
         url_contains: str | None = None,
     ) -> dict[str, Any]:
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             inspector = session.network_inspector
             if inspector is None:
@@ -259,7 +259,7 @@ class BrowserDiagnosticsService:
         """GET /sessions/{id}/diagnostics: the tab-scoped DevTools digest --
         recent console errors/warnings, failed requests with their bodies,
         visible validation messages, and the tab's own url/title."""
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             return await self.manager.session_lifecycle.guarded(
                 session, self._get_diagnostics_locked(session, limit=limit),
@@ -366,7 +366,7 @@ class BrowserDiagnosticsService:
                 )
 
     async def screenshot_diff(self, session_id: str) -> dict[str, Any]:
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
             artifact_dir = session.artifact_dir
             prior_shots = sorted(

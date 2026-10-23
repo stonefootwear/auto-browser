@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 from ...navigation_policy import await_public_dns_check
 from ..tab_view import (
     TabView,
+    _is_closed,
     forget_tab_activity,
     page_for_tab,
     set_tab_owner,
@@ -26,7 +27,9 @@ class BrowserTabService:
         self.manager = manager
 
     async def list(self, session_id: str) -> list[dict[str, Any]]:
-        session = unwrap_session(await self.manager.get_session(session_id))
+        session = self.manager.sessions.get(session_id)
+        if session is None:
+            raise KeyError(session_id)
         # Read-only: the shared side, so the owner's tab strip polling this
         # never waits behind (or holds up) the employees' tab actions.
         async with session.lock.shared():
@@ -174,7 +177,7 @@ class BrowserTabService:
         # when asked through one employee's tab view.
         session = unwrap_session(session)
         tabs: list[dict[str, Any]] = []
-        for index, page in enumerate(self.pages(session)):
+        for index, page in enumerate(page for page in self.pages(session) if not _is_closed(page)):
             self.manager._attach_page_listeners(page, session)
             try:
                 # One wedged background tab must not stall the whole list

@@ -407,6 +407,48 @@ class TabViewTests(_ManagerCase):
         self.assertIs(again.page, opener)
         self.assertEqual(tab_id_for(self.session, opener), tab_id)
 
+    async def test_passive_reads_never_rebind_closed_popup_or_heal_active_page(self) -> None:
+        opened = await self.open("emad")
+        tab_id = opened["tab_id"]
+        view = await self.view(tab_id)
+        opener = view.page
+        popup = FakePage(self.context, "https://accounts.example.com/", "Sign in")
+        self.context.pages.append(popup)
+        self.session.popup_openers[popup] = opener
+        view.page = popup
+        self.manager.observation.observation_payload = AsyncMock(
+            return_value={"url": popup.url, "title": "Sign in", "screenshot_url": None}
+        )
+
+        token = current_tab_id.set(tab_id)
+        try:
+            self.assertEqual((await self.manager.observe("s1"))["url"], popup.url)
+            self.assertIs(self.manager.observation.observation_payload.await_args.args[0].page, popup)
+            await popup.close()
+            with self.assertRaises(BrowserActionError) as gone:
+                await self.manager.observe("s1")
+            self.assertEqual((gone.exception.status_code, gone.exception.code), (410, "tab_gone"))
+        finally:
+            current_tab_id.reset(token)
+        self.assertNotEqual(tab_id_for(self.session, opener), tab_id)
+        self.assertEqual(len(self.context.pages), 2)
+
+        active_popup = FakePage(self.context, "https://owner.example.com/", "Owner popup")
+        self.context.pages.append(active_popup)
+        self.session.popup_openers[active_popup] = self.owner_page
+        self.session.page = active_popup
+        await active_popup.close()
+        tabs = await self.manager.list_tabs("s1")
+        self.assertEqual(len(tabs), 2)
+        self.assertFalse(any(tab["active"] for tab in tabs))
+        self.assertIs(self.session.page, active_popup)
+        with self.assertRaises(BrowserActionError) as active_gone:
+            await self.manager.get_session("s1", read_only=True)
+        self.assertEqual((active_gone.exception.status_code, active_gone.exception.code), (410, "tab_gone"))
+
+        self.assertIs((await self.view(tab_id)).page, opener)  # mutating lookup keeps fallback
+        self.assertIs((await self.manager.get_session("s1")).page, self.owner_page)
+
     async def test_two_views_on_different_pages_run_concurrently(self) -> None:
         first = await self.open("emad")
         second = await self.open("ziad")

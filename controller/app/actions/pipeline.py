@@ -245,19 +245,20 @@ class BrowserActionPipeline:
             raise PermissionError(witness_state.outcome.block_reason or "Witness policy blocked this action")
         await context.operation()
         dialogs = _dialogs(manager)
-        if dialogs is not None:
+        if dialogs is not None and context.action_name != "wait":
             followed = await dialogs.follow_popup(session)
             if followed is not None:
                 context.target["popup"] = followed
             if dialogs.heal_active_page(session):
                 context.target["returned_to_opener"] = True
+        if dialogs is not None:
             open_dialog = await dialogs.open_dialog(session)
             if open_dialog is not None:
                 # The page is blocked until the dialog is answered: report it and
                 # stop here (every probe below would hang on it).
                 context.target["dialog"] = open_dialog
                 return
-        totp_result = await manager._maybe_handle_totp(session)
+        totp_result = None if context.action_name == "wait" else await manager._maybe_handle_totp(session)
         if totp_result is not None:
             context.target.setdefault("totp", totp_result)
         manager._assert_runtime_url_allowed(session.page.url)

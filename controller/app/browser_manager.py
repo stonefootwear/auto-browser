@@ -513,8 +513,8 @@ class BrowserManager:
             unattended=unattended,
         )
 
-    async def get_session(self, session_id: str) -> BrowserSession:
-        return await self.session_lifecycle.get(session_id)
+    async def get_session(self, session_id: str, *, read_only: bool = False) -> BrowserSession:
+        return await self.session_lifecycle.get(session_id, read_only=read_only)
 
     async def get_session_record(self, session_id: str) -> dict[str, Any]:
         return await self.session_lifecycle.get_record(session_id)
