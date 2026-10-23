@@ -459,6 +459,7 @@ PAGE_SUMMARY_SCRIPT = r"""
     }));
 
   return {
+    scroll_position: {x: window.scrollX, y: window.scrollY},
     text_excerpt: squash(document.body?.innerText || '', textLimit),
     dom_outline: {
       headings,
