@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from ... import events as _events
+from ...action_errors import BrowserActionError
 from ...browser_scripts import ACTIVE_ELEMENT_SCRIPT, DOM_QUERY_SCRIPT, INTERACTABLES_SCRIPT, PAGE_SUMMARY_SCRIPT
+from ..tab_view import _is_closed, page_for_tab, unwrap_session
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -124,7 +126,7 @@ class BrowserObservationService:
         async with session.lock:
             result = await self.manager.session_lifecycle.guarded(
                 session,
-                self.observation_payload(session, limit=limit, preset=preset),
+                self.observation_payload(session, limit=limit, preset=preset, read_only=True),
                 what="observe",
                 timeout=self.manager.settings.browser_call_timeout_seconds,
             )
@@ -316,15 +318,26 @@ class BrowserObservationService:
         limit: int = 40,
         screenshot_label: str = "observe",
         preset: str | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         from .dialogs import BrowserDialogService
 
+        if read_only:
+            real = unwrap_session(session)
+            page = session.page
+            if (_is_closed(page) or (getattr(session, "tab_scoped", False)
+                    and page_for_tab(real, session.tab_id, self.manager.tabs.pages(real), read_only=True) is not page)):
+                raise BrowserActionError(
+                    "That tab is no longer open. List the tabs or open a new one.",
+                    code="tab_gone", status_code=410, retryable=True,
+                )
         dialogs = getattr(self.manager, "dialogs", None)
         if not isinstance(dialogs, BrowserDialogService):
             return await self._observation_payload(
                 session, limit=limit, screenshot_label=screenshot_label, preset=preset
             )
-        dialogs.heal_active_page(session)
+        if not read_only:
+            dialogs.heal_active_page(session)
         open_dialog = await dialogs.open_dialog(session)
         if open_dialog is not None:
             # The tab is blocked by a JavaScript dialog: every page read would

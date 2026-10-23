@@ -390,7 +390,10 @@ class BrowserActionPipeline:
     ) -> dict[str, Any]:
         manager = context.manager
         session = context.session
-        after = await manager._observation_payload(session, limit=20, screenshot_label=f"after-{context.action_name}")
+        after = await manager._observation_payload(
+            session, limit=20, screenshot_label=f"after-{context.action_name}",
+            read_only=context.action_name == "wait",
+        )
         session.last_action = context.action_name
         verification = manager._action_verification(context.action_name, context.target, witness_state.before, after)
         action_class = manager._action_class(context.action_name)

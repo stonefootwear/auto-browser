@@ -624,6 +624,7 @@ class BrowserManager:
         limit: int = 40,
         screenshot_label: str = "observe",
         preset: str = "normal",
+        read_only: bool = False,
     ) -> dict[str, Any]:
         from .browser.services.observation import redact_api_keys
 
@@ -632,6 +633,7 @@ class BrowserManager:
             limit=limit,
             screenshot_label=screenshot_label,
             preset=preset,
+            read_only=read_only,
         ))
 
     async def _light_snapshot(self, session: BrowserSession, *, label: str) -> dict[str, Any]:

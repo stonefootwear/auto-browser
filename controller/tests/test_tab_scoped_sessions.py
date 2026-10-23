@@ -10,7 +10,7 @@ import weakref
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -416,18 +416,31 @@ class TabViewTests(_ManagerCase):
         self.context.pages.append(popup)
         self.session.popup_openers[popup] = opener
         view.page = popup
-        self.manager.observation.observation_payload = AsyncMock(
+        self.manager.observation._observation_payload = AsyncMock(
             return_value={"url": popup.url, "title": "Sign in", "screenshot_url": None}
         )
+        self.manager.dialogs.open_dialog = AsyncMock(return_value=None)
+        self.manager.dialogs.heal_active_page = Mock()
 
         token = current_tab_id.set(tab_id)
         try:
             self.assertEqual((await self.manager.observe("s1"))["url"], popup.url)
-            self.assertIs(self.manager.observation.observation_payload.await_args.args[0].page, popup)
+            self.assertIs(self.manager.observation._observation_payload.await_args.args[0].page, popup)
+            self.manager.dialogs.heal_active_page.assert_not_called()
             await popup.close()
+            with self.assertRaises(BrowserActionError) as snapshot_gone:
+                await self.manager._observation_payload(view, read_only=True)
+            self.assertEqual((snapshot_gone.exception.status_code, snapshot_gone.exception.code), (410, "tab_gone"))
             with self.assertRaises(BrowserActionError) as gone:
                 await self.manager.observe("s1")
             self.assertEqual((gone.exception.status_code, gone.exception.code), (410, "tab_gone"))
+            with self.assertRaises(BrowserActionError) as wait_gone:
+                await self.manager.action_pipeline._record_success(
+                    SimpleNamespace(manager=self.manager, session=view, action_name="wait"),
+                    SimpleNamespace(),
+                )
+            self.assertEqual((wait_gone.exception.status_code, wait_gone.exception.code), (410, "tab_gone"))
+            self.manager.dialogs.heal_active_page.assert_not_called()
         finally:
             current_tab_id.reset(token)
         self.assertNotEqual(tab_id_for(self.session, opener), tab_id)
