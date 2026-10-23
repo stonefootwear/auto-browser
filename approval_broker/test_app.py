@@ -1366,8 +1366,15 @@ def test_owner_tab_endpoints_are_owner_only_and_bound_to_the_owner_session(
         shown = client.post("/owner/sessions/owner-1/tabs/activate", headers=auth(OWNER), json={"index": 1})
         assert shown.status_code == 200
         assert ("POST", "/sessions/owner-1/tabs/activate", {"index": 1}, None) in calls
+        stable = client.post("/owner/sessions/owner-1/tabs/activate", headers=auth(OWNER),
+                             json={"index": 0, "tab_id": "t-bbbbbbbbbbbb"})
+        assert stable.status_code == 200
+        assert ("POST", "/sessions/owner-1/tabs/activate",
+                {"index": 0, "tab_id": "t-bbbbbbbbbbbb"}, None) in calls
         assert client.post("/owner/sessions/owner-1/tabs/activate", headers=auth(OWNER),
                            json={"index": -1}).status_code == 422
+        assert client.post("/owner/sessions/owner-1/tabs/activate", headers=auth(OWNER),
+                           json={"index": 1, "tab_id": "bad"}).status_code == 422
         assert client.post("/owner/sessions/owner-1/tabs/activate", headers=auth(OWNER),
                            json={"index": 1, "x": 1}).status_code == 422
 

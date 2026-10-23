@@ -93,11 +93,30 @@ class BrowserTabManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tabs[1]["title"], "Export")
 
     async def test_activate_tab_switches_active_page(self) -> None:
+        # Legacy callers can still select by the current index.
         result = await self.manager.activate_tab(self.session.id, 1)
 
         self.assertEqual(self.session.page.url, "https://example.com/export")
         self.assertEqual(result["tabs"][1]["active"], True)
         self.assertEqual(self.session.page.front_calls, 1)
+
+        # The owner portal carries the stable id it displayed. If an earlier
+        # page disappears before the click arrives, that id still selects the
+        # intended page instead of whatever moved into the stale index.
+        target = FakeTabPage(self.session.context, "https://example.com/flow", "Flow")
+        self.session.context.pages.append(target)
+        tabs = await self.manager.list_tabs(self.session.id)
+        gone_id = tabs[0]["tab_id"]
+        target_id = tabs[2]["tab_id"]
+        await self.session.context.pages[0].close()
+        result = await self.manager.tabs.activate(self.session.id, 2, tab_id=target_id)
+        self.assertIs(self.session.page, target)
+        self.assertEqual(result["index"], 1)
+
+        # A closed/stale id never falls back to the supplied index.
+        with self.assertRaises(ValueError):
+            await self.manager.tabs.activate(self.session.id, 0, tab_id=gone_id)
+        self.assertIs(self.session.page, target)
 
     async def test_close_tab_closes_secondary_page(self) -> None:
         result = await self.manager.close_tab(self.session.id, 1)

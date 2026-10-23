@@ -133,7 +133,7 @@ TAB_STRIP_SCRIPT = ("""(function () {
       button.title = tab.host || '';
       button.addEventListener('click', function () {
         lastManualSwitchAt = Date.now();
-        show(tab.index);
+        show(tab);
       });
       item.appendChild(button);
       list.appendChild(item);
@@ -160,7 +160,7 @@ TAB_STRIP_SCRIPT = ("""(function () {
     if (!active || !best || best.tab_id === active.tab_id) { return; }
     if (typeof active.last_action_at === 'number' && active.last_action_at >= best.last_action_at) { return; }
     lastAutoFollowAt = now;
-    show(best.index);
+    show(best);
   }
 
   function poll() {
@@ -176,11 +176,11 @@ TAB_STRIP_SCRIPT = ("""(function () {
         note.textContent = '\u0627\u0644\u062C\u0644\u0633\u0629 \u0642\u062F\u064A\u0645\u0629 \u0623\u0648 \u0645\u0642\u0641\u0648\u0644\u0629 \u062F\u0644\u0648\u0642\u062A\u064A \u2014 \u0627\u0641\u062A\u062D \u0627\u0644\u0645\u062A\u0635\u0641\u062D \u0645\u0646 \u062A\u062D\u062A.';
       });
   }
-  function show(index) {
+  function show(tab) {
     fetch('/api/browser/tabs/activate', {
       method: 'POST', credentials: 'same-origin',
       headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
-      body: JSON.stringify({index: index})
+      body: JSON.stringify({index: tab.index, tab_id: tab.tab_id})
     }).then(poll, poll);
   }
   if (box.getAttribute('data-viewable') !== '1') {
@@ -2149,6 +2149,10 @@ def create_app(
             index = int(index)
         if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index <= 500:
             raise HTTPException(422, "Invalid index")
+        tab_id = data.get("tab_id")
+        if "tab_id" in data and (not isinstance(tab_id, str)
+                                 or re.fullmatch(r"t-[0-9a-f]{12}", tab_id) is None):
+            raise HTTPException(422, "Invalid tab id")
         session_id = await viewer_session_id(row)
         if session_id is None:
             raise HTTPException(403, VIEWER_DENIAL_AR)
@@ -2156,7 +2160,9 @@ def create_app(
         try:
             response = await selected_broker.post(
                 f"{BROKER_TABS_PREFIX}{quote(session_id, safe='')}/tabs/activate",
-                headers=internal_headers(selected_owner_token), json={"index": index}, timeout=100,
+                headers=internal_headers(selected_owner_token),
+                json={"index": index, **({"tab_id": tab_id} if tab_id is not None else {})},
+                timeout=100,
             )
         except httpx.HTTPError:
             raise HTTPException(502, "Browser service unavailable") from None

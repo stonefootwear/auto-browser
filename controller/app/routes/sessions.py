@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from ..action_errors import BrowserActionError
 from ..approvals import ApprovalRequiredError
 from ..models import (
+    ActivateTabRequest,
     AttachFileRequest,
     ClickRequest,
     CreateSessionRequest,
@@ -143,9 +144,13 @@ def create_sessions_router(*, manager: Any) -> APIRouter:
         return await manager.list_tabs(session_id)
 
     @router.post("/sessions/{session_id}/tabs/activate")
-    async def activate_tab(session_id: str, payload: TabIndexRequest) -> dict[str, Any]:
+    async def activate_tab(session_id: str, payload: ActivateTabRequest) -> dict[str, Any]:
         try:
-            return await manager.activate_tab(session_id, payload.index)
+            if payload.tab_id is None:
+                return await manager.activate_tab(session_id, payload.index)
+            return await manager.tabs.activate(
+                session_id, payload.index, tab_id=payload.tab_id,
+            )
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid request") from None
 

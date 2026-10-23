@@ -7,6 +7,7 @@ from ...navigation_policy import await_public_dns_check
 from ..tab_view import (
     TabView,
     forget_tab_activity,
+    page_for_tab,
     set_tab_owner,
     tab_id_for,
     tab_last_action_at,
@@ -89,19 +90,29 @@ class BrowserTabService:
         await view.page.goto(url, wait_until="domcontentloaded")
         await self.manager._settle(view.page)
 
-    async def activate(self, session_id: str, index: int) -> dict[str, Any]:
+    async def activate(
+        self, session_id: str, index: int, *, tab_id: str | None = None,
+    ) -> dict[str, Any]:
         session = await self.manager.get_session(session_id)
         async with session.lock:
             return await self.manager.session_lifecycle.guarded(
-                session, self._activate_locked(session, index), what="activate_tab",
+                session, self._activate_locked(session, index, tab_id), what="activate_tab",
                 timeout=self.manager.settings.browser_action_timeout_seconds,
             )
 
-    async def _activate_locked(self, session: "BrowserSession", index: int) -> dict[str, Any]:
+    async def _activate_locked(
+        self, session: "BrowserSession", index: int, tab_id: str | None,
+    ) -> dict[str, Any]:
         pages = self.pages(session)
-        if index < 0 or index >= len(pages):
-            raise ValueError(f"Unknown tab index: {index}")
-        target_page = pages[index]
+        if tab_id is not None:
+            target_page = page_for_tab(session, tab_id, pages)
+            if target_page is None:
+                raise ValueError(f"Unknown tab id: {tab_id}")
+            index = pages.index(target_page)
+        else:
+            if index < 0 or index >= len(pages):
+                raise ValueError(f"Unknown tab index: {index}")
+            target_page = pages[index]
         self.manager._attach_page_listeners(target_page, session)
         if hasattr(target_page, "bring_to_front"):
             await target_page.bring_to_front()

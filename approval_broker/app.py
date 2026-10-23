@@ -428,6 +428,7 @@ class OwnerTypeRequest(StrictModel):
 
 class OwnerActivateTabRequest(StrictModel):
     index: int = Field(ge=0, le=500)
+    tab_id: str | None = Field(default=None, pattern=r"^t-[0-9a-f]{12}$")
 
 
 class Action(StrictModel):
@@ -1061,7 +1062,10 @@ def create_app(
         """Show that tab in the owner's live view -- owner-initiated only."""
         require_role(authorization, "owner")
         session_id = await owner_trusted_session(session_id)
-        return await upstream("POST", f"/sessions/{session_id}/tabs/activate", {"index": payload.index})
+        body = {"index": payload.index}
+        if payload.tab_id is not None:
+            body["tab_id"] = payload.tab_id
+        return await upstream("POST", f"/sessions/{session_id}/tabs/activate", body)
 
     @app.delete("/owner/sessions/{session_id}")
     async def owner_close_session(session_id: str, authorization: str | None = Header(default=None)):
