@@ -133,11 +133,11 @@ def _is_closed(page: Any) -> bool:
     return bool(getattr(page, "closed", False))
 
 
-def page_for_tab(session: Any, tab_id: str, pages: Iterable[Any]) -> Any | None:
+def page_for_tab(session: Any, tab_id: str, pages: Iterable[Any], *, read_only: bool = False) -> Any | None:
     """The live page carrying ``tab_id``, or None when that tab is gone.
 
-    A tab whose page is a closed popup (sign-in window that closed itself)
-    falls back to the page that opened it, like the active tab does.
+    Mutating lookups retain the closed-popup fallback to its opener. Passive
+    reads require this exact page still to be open and never rebind the id.
     """
     session = unwrap_session(session)
     live = [page for page in pages if not _is_closed(page)]
@@ -145,6 +145,8 @@ def page_for_tab(session: Any, tab_id: str, pages: Iterable[Any]) -> Any | None:
     for page in live:
         if tab_ids.get(page) == tab_id:
             return page
+    if read_only:
+        return None
     for page, page_tab_id in list(tab_ids.items()):
         if page_tab_id != tab_id or not _is_closed(page):
             continue

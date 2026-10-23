@@ -513,8 +513,8 @@ class BrowserManager:
             unattended=unattended,
         )
 
-    async def get_session(self, session_id: str) -> BrowserSession:
-        return await self.session_lifecycle.get(session_id)
+    async def get_session(self, session_id: str, *, read_only: bool = False) -> BrowserSession:
+        return await self.session_lifecycle.get(session_id, read_only=read_only)
 
     async def get_session_record(self, session_id: str) -> dict[str, Any]:
         return await self.session_lifecycle.get_record(session_id)
@@ -624,6 +624,7 @@ class BrowserManager:
         limit: int = 40,
         screenshot_label: str = "observe",
         preset: str = "normal",
+        read_only: bool = False,
     ) -> dict[str, Any]:
         from .browser.services.observation import redact_api_keys
 
@@ -632,6 +633,7 @@ class BrowserManager:
             limit=limit,
             screenshot_label=screenshot_label,
             preset=preset,
+            read_only=read_only,
         ))
 
     async def _light_snapshot(self, session: BrowserSession, *, label: str) -> dict[str, Any]:

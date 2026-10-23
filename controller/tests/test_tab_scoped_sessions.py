@@ -10,7 +10,7 @@ import weakref
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -23,8 +23,10 @@ from app.browser.tab_view import (
     TabView,
     bind_tab,
     page_for_tab,
+    set_tab_owner,
     tab_id_for,
     tab_last_action_at,
+    tab_owner,
     unwrap_session,
 )
 from app.browser_manager import BrowserManager, BrowserSession
@@ -406,6 +408,107 @@ class TabViewTests(_ManagerCase):
         again = await self.view(tab_id)
         self.assertIs(again.page, opener)
         self.assertEqual(tab_id_for(self.session, opener), tab_id)
+
+    async def test_passive_reads_never_rebind_closed_popup_or_heal_active_page(self) -> None:
+        opened = await self.open("emad")
+        tab_id = opened["tab_id"]
+        view = await self.view(tab_id)
+        opener = view.page
+        popup = FakePage(self.context, "https://accounts.example.com/", "Sign in")
+        self.context.pages.append(popup)
+        self.session.popup_openers[popup] = opener
+        view.page = popup
+        self.manager.observation._observation_payload = AsyncMock(
+            return_value={"url": popup.url, "title": "Sign in", "screenshot_url": None}
+        )
+        self.manager.dialogs.open_dialog = AsyncMock(return_value=None)
+        heal_active_page = self.manager.dialogs.heal_active_page
+        self.manager.dialogs.heal_active_page = Mock()
+
+        token = current_tab_id.set(tab_id)
+        try:
+            self.assertEqual((await self.manager.observe("s1"))["url"], popup.url)
+            self.assertIs(self.manager.observation._observation_payload.await_args.args[0].page, popup)
+            self.manager.dialogs.heal_active_page.assert_not_called()
+            await popup.close()
+            with self.assertRaises(BrowserActionError) as snapshot_gone:
+                await self.manager._observation_payload(view, read_only=True)
+            self.assertEqual((snapshot_gone.exception.status_code, snapshot_gone.exception.code), (410, "tab_gone"))
+            with self.assertRaises(BrowserActionError) as gone:
+                await self.manager.observe("s1")
+            self.assertEqual((gone.exception.status_code, gone.exception.code), (410, "tab_gone"))
+            with self.assertRaises(BrowserActionError) as wait_gone:
+                await self.manager.action_pipeline._record_success(
+                    SimpleNamespace(manager=self.manager, session=view, action_name="wait"),
+                    SimpleNamespace(),
+                )
+            self.assertEqual((wait_gone.exception.status_code, wait_gone.exception.code), (410, "tab_gone"))
+            self.manager.dialogs.heal_active_page.assert_not_called()
+        finally:
+            current_tab_id.reset(token)
+        self.assertNotEqual(tab_id_for(self.session, opener), tab_id)
+        self.assertEqual(len(self.context.pages), 2)
+
+        active_popup = FakePage(self.context, "https://owner.example.com/", "Owner popup")
+        self.context.pages.append(active_popup)
+        self.session.popup_openers[active_popup] = self.owner_page
+        self.session.page = active_popup
+        await active_popup.close()
+        tabs = await self.manager.list_tabs("s1")
+        self.assertEqual(len(tabs), 2)
+        self.assertFalse(any(tab["active"] for tab in tabs))
+        self.assertIs(self.session.page, active_popup)
+        with self.assertRaises(BrowserActionError) as active_gone:
+            await self.manager.get_session("s1", read_only=True)
+        self.assertEqual((active_gone.exception.status_code, active_gone.exception.code), (410, "tab_gone"))
+
+        self.manager.dialogs.heal_active_page = heal_active_page
+        self.assertIs((await self.view(tab_id)).page, opener)  # mutating lookup keeps fallback
+        self.assertIs((await self.manager.get_session("s1")).page, self.owner_page)
+
+        # Renderer repair may choose a new physical page, but that page must
+        # not acquire the crashed tab's logical id or employee ownership.
+        crashed = FakePage(self.context, "https://crashed.example.com/", "Crashed")
+        self.context.pages = [crashed]
+        self.session.page = crashed
+        crashed_id = tab_id_for(self.session, crashed)
+        set_tab_owner(self.session, crashed_id, "emad")
+        self.session.crashed_pages[crashed] = "Target crashed"
+        self.session.pending_crashed_pages.add(crashed)
+
+        async def new_page() -> FakePage:
+            replacement = FakePage(self.context, "about:blank", "Replacement")
+            replacement.set_default_timeout = Mock()  # type: ignore[attr-defined]
+            self.context.pages.append(replacement)
+            return replacement
+
+        self.context.new_page = new_page  # type: ignore[method-assign]
+        self.manager.audit.append = AsyncMock()  # type: ignore[method-assign]
+        self.manager.session_lifecycle.persist = AsyncMock()  # type: ignore[method-assign]
+        with patch("app.browser.services.sessions.session_connection_problem", return_value=None):
+            self.assertTrue(
+                await self.manager.session_lifecycle.recover_crashed_page(
+                    self.session, crashed, reason="Target crashed"
+                )
+            )
+        replacement = self.session.page
+        replacement_id = tab_id_for(self.session, replacement)
+        self.assertNotEqual(replacement_id, crashed_id)
+        self.assertIsNone(tab_owner(self.session, replacement_id))
+        token = current_tab_id.set(crashed_id)
+        try:
+            with self.assertRaises(BrowserActionError) as repaired_gone:
+                await self.manager.get_session("s1", read_only=True)
+            self.assertEqual(
+                (repaired_gone.exception.status_code, repaired_gone.exception.code), (410, "tab_gone")
+            )
+        finally:
+            current_tab_id.reset(token)
+
+        self.manager.sessions.pop("s1")
+        with self.assertRaises(BrowserActionError) as uninitialized:
+            await self.manager.list_tabs("s1")
+        self.assertEqual((uninitialized.exception.status_code, uninitialized.exception.code), (410, "tab_gone"))
 
     async def test_two_views_on_different_pages_run_concurrently(self) -> None:
         first = await self.open("emad")

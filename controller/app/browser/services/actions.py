@@ -388,7 +388,7 @@ class BrowserActionService:
         )
 
     async def wait(self, session_id: str, wait_ms: int) -> dict[str, Any]:
-        session = await self.manager.get_session(session_id)
+        session = await self.manager.get_session(session_id, read_only=True)
 
         async def operation() -> None:
             await asyncio.sleep(max(0, wait_ms) / 1000)
