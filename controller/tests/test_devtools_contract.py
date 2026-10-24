@@ -4,6 +4,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -142,7 +143,24 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
                             session, employee_page,
                             SimpleNamespace(request=request, url=url, status=204),
                             manager.diagnostics._navigation_ids[employee_page],
+                            manager.diagnostics._request_scopes[request][2],
                         )
+                    for order in ((0, 1), (1, 0)):
+                        requests = [SyntheticRequest(f"https://example.test/concurrent?code=FixtureOnly{index}")
+                                    for index in range(2)]
+                        for request in requests:
+                            manager.diagnostics._on_request(session, employee_page, request)
+                        pending = []
+                        with patch("app.browser.services.diagnostics.spawn_background_task", side_effect=pending.append):
+                            for index in order:
+                                request = requests[index]
+                                manager.diagnostics._schedule_response(
+                                    session, employee_page,
+                                    SimpleNamespace(request=request, url=request.url, status=(200, 503)[index], headers={}),
+                                )
+                                manager.diagnostics._request_scopes.pop(request)
+                        for response_task in pending:
+                            await response_task
                     network = await client.get(
                         f"/sessions/{session.id}/network-log", headers=headers,
                     )
@@ -150,8 +168,11 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
                     assert network.json()["session"]["current_url"] == employee_page.url
                     assert "owner-only-value" not in str(network.json())
                     entries = network.json()["entries"]
-                    assert [entry["url"] for entry in entries] == [expected for _url, expected in reversed(network_urls)]
-                    assert all(entry["status"] == 204 for entry in entries)
+                    assert [(entry["url"], entry["status"]) for entry in entries[:4]] == [
+                        ("https://example.test/concurrent", 503), ("https://example.test/concurrent", 200),
+                    ] * 2
+                    assert [entry["url"] for entry in entries[4:]] == [expected for _url, expected in reversed(network_urls)]
+                    assert all(entry["status"] == 204 for entry in entries[4:])
                     assert "FixtureOnly" not in str(entries)
 
             finally:
