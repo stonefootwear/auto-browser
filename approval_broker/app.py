@@ -63,6 +63,9 @@ DEVTOOLS_OPERATIONS = frozenset({
     "handle_dialog", "take_screenshot", "evaluate_script",
     "list_network_requests", "list_pages", "select_page",
 })
+TRUSTED_READ_PROJECTIONS = frozenset({
+    "document.readyState", "document.visibilityState", "window.innerWidth", "window.innerHeight",
+})
 # Controller error codes whose meaning an agent needs to act on (answer the
 # dialog, hand a captcha to the owner). Only the code and the dialog's own
 # type/text are relayed -- never the rest of the controller's error body.
@@ -1171,8 +1174,8 @@ def create_app(
         if operation == "evaluate_script":
             headers = _pop_tab_id(arguments)
             expression = arguments.get("expression")
-            if set(arguments) != {"expression"} or not isinstance(expression, str):
-                raise HTTPException(400, "evaluate_script requires expression")
+            if set(arguments) != {"expression"} or expression not in TRUSTED_READ_PROJECTIONS:
+                raise HTTPException(400, "evaluate_script requires a trusted diagnostic projection")
             return "POST", f"/sessions/{session_id}/actions/evaluate-script", arguments, headers
         if operation == "list_network_requests":
             headers = _pop_tab_id(arguments)

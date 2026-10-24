@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import weakref
 from dataclasses import dataclass, field
@@ -50,7 +49,7 @@ from .navigation_policy import assert_resolves_public, check_public_url
 from .network_inspector import NetworkInspector
 from .ocr import OCRExtractor
 from .persistent_profiles import PersistentProfileClient
-from .pii_scrub import PiiScrubber, scrub_text
+from .pii_scrub import PiiScrubber
 from .session_isolation import DockerBrowserNodeProvisioner, IsolatedBrowserRuntime
 from .session_store import DurableSessionStore
 from .session_tunnel import IsolatedSessionTunnel, IsolatedSessionTunnelBroker
@@ -65,60 +64,12 @@ from .witness import (
     WitnessSessionContext,
 )
 
-def _scrub_script_result(value: Any, secret_values: tuple[str, ...] = ()) -> Any:
-    def scrub_string(text: str) -> str:
-        for secret in secret_values:
-            if secret:
-                text = text.replace(secret, "[REDACTED]")
-        return text
-
-    if isinstance(value, dict):
-        return {
-            scrub_string(str(key)): _scrub_script_result(item, secret_values)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_scrub_script_result(item, secret_values) for item in value]
-    if isinstance(value, str):
-        return scrub_string(value)
-    return value
-
-
-async def _runtime_secret_values(session: "BrowserSession") -> tuple[str, ...]:
-    """Read actual credential-bearing values inside the trusted controller for redaction.
-
-    This is data provenance, not an expression keyword policy: the caller's script remains
-    arbitrary but side-effect blocked, while any value already present in a form field,
-    browser storage, or cookie is removed from its returned result before it can leave the
-    controller.
-    """
-    page_values = await session.page.evaluate("""
-        () => {
-          const values = [];
-          for (const field of document.querySelectorAll('input, textarea')) {
-            if (typeof field.value === 'string' && field.value) values.push(field.value);
-          }
-          for (const name of ['localStorage', 'sessionStorage']) {
-            try {
-              const storage = window[name];
-              for (let i = 0; i < storage.length; i += 1) {
-                const value = storage.getItem(storage.key(i));
-                if (typeof value === 'string' && value) values.push(value);
-              }
-            } catch (_) {}
-          }
-          return values;
-        }
-    """)
-    values = {
-        value for value in (page_values if isinstance(page_values, list) else [])
-        if isinstance(value, str) and value
-    }
-    for cookie in await session.page.context.cookies():
-        value = cookie.get("value") if isinstance(cookie, dict) else None
-        if isinstance(value, str) and value:
-            values.add(value)
-    return tuple(sorted(values, key=len, reverse=True))
+_TRUSTED_READ_PROJECTIONS = {
+    "document.readyState": "document.readyState",
+    "document.visibilityState": "document.visibilityState",
+    "window.innerWidth": "window.innerWidth",
+    "window.innerHeight": "window.innerHeight",
+}
 
 
 logger = logging.getLogger(__name__)
@@ -669,42 +620,23 @@ class BrowserManager:
         return await self.observation.snapshot(session_id)
 
     async def evaluate_script(self, session_id: str, expression: str) -> Any:
-        """Evaluate a read-only expression through CDP.
+        """Return one fixed, non-content browser diagnostic projection.
 
-        ``throwOnSideEffect`` is the existing Chromium boundary that prevents
-        this diagnostic tool from clicking, submitting, navigating, spending,
-        or otherwise becoming a second action path. Only by-value results leave
-        the controller and they pass the unconditional credential scrub below.
+        The caller never supplies JavaScript to Chromium.  A short exact allowlist keeps the
+        standard tool name useful for built-in diagnostics without letting a worker encode,
+        slice, or transform secret-bearing DOM/storage/cookie values around a redactor.
         """
-        from .browser.services.observation import redact_api_keys
-
+        trusted_expression = _TRUSTED_READ_PROJECTIONS.get(expression)
+        if trusted_expression is None:
+            raise ValueError("only trusted browser diagnostic projections are supported")
         session = await self.get_session(session_id, read_only=True)
         async with session.lock:
-            secret_values = await _runtime_secret_values(session)
-            cdp = await session.page.context.new_cdp_session(session.page)
-            try:
-                response = await self.session_lifecycle.guarded(
-                    session,
-                    cdp.send("Runtime.evaluate", {
-                        "expression": expression,
-                        "returnByValue": True,
-                        "throwOnSideEffect": True,
-                        "awaitPromise": False,
-                    }),
-                    what="evaluate_script",
-                    timeout=self.settings.browser_call_timeout_seconds,
-                )
-            finally:
-                await cdp.detach()
-        if response.get("exceptionDetails"):
-            raise ValueError("script was rejected or could not be evaluated without side effects")
-        remote = response.get("result") if isinstance(response, dict) else None
-        if not isinstance(remote, dict) or "value" not in remote:
-            raise ValueError("script result is not JSON-serializable")
-        value = _scrub_script_result(redact_api_keys(remote["value"]), secret_values)
-        serialized = json.dumps(value, ensure_ascii=False)
-        scrubbed = scrub_text(serialized).text
-        return json.loads(scrubbed)
+            return await self.session_lifecycle.guarded(
+                session,
+                session.page.evaluate(trusted_expression),
+                what="evaluate_script",
+                timeout=self.settings.browser_call_timeout_seconds,
+            )
 
     async def wait_for(self, session_id: str, *, text: str | None, uid: str | None,
                        timeout_ms: int) -> dict[str, Any]:

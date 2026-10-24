@@ -177,7 +177,7 @@ def test_devtools_contract_stays_grant_and_tab_scoped(tmp_path: Path, clock: lis
             ("click", {"tab_id": tab_id, "element_id": "op-button1"}),
             ("fill", {"tab_id": tab_id, "uid": "op-field1", "value": "hello"}),
             ("wait_for", {"tab_id": tab_id, "uid": "op-field1", "timeout_ms": 5000}),
-            ("evaluate_script", {"tab_id": tab_id, "expression": "document.title"}),
+            ("evaluate_script", {"tab_id": tab_id, "expression": "document.readyState"}),
             ("list_network_requests", {"tab_id": tab_id, "limit": 25, "method": "POST"}),
         ):
             response = client.post(
@@ -223,8 +223,17 @@ def test_devtools_contract_stays_grant_and_tab_scoped(tmp_path: Path, clock: lis
         assert ("POST", "/sessions/owner-1/actions/wait-for", "",
                 {"uid": "op-field1", "timeout_ms": 5000}, tab_id) in calls
         assert ("POST", "/sessions/owner-1/actions/evaluate-script", "",
-                {"expression": "document.title"}, tab_id) in calls
+                {"expression": "document.readyState"}, tab_id) in calls
         assert ("GET", "/sessions/owner-1/network-log", "limit=25&method=POST", None, tab_id) in calls
+
+        encoded_secret = client.post(
+            "/mcp/tools/call", headers=auth(AGENT),
+            json={"name": "browser.evaluate_script", "arguments": {
+                "request_id": request_id, "tab_id": tab_id,
+                "expression": "btoa(document.cookie)",
+            }},
+        )
+        assert encoded_secret.status_code == 400
 
         # A direct call without the owner-session grant remains unavailable.
         denied = client.post(

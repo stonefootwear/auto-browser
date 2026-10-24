@@ -45,6 +45,10 @@ TAB_SCOPED_ACTIONS = (
 _SEGMENT = r"[^/]+"
 _TAB_SCOPED_PATHS = (
     (re.compile(rf"^/sessions/{_SEGMENT}/observe/?$"), {"GET", "POST"}),
+    (re.compile(rf"^/sessions/{_SEGMENT}/snapshot/?$"), {"GET"}),
+    (re.compile(rf"^/sessions/{_SEGMENT}/actions/evaluate-script/?$"), {"POST"}),
+    (re.compile(rf"^/sessions/{_SEGMENT}/actions/wait-for/?$"), {"POST"}),
+    (re.compile(rf"^/sessions/{_SEGMENT}/network-log/?$"), {"GET"}),
     # The "raw view" digest (browser_diagnostics / browser.diagnostics):
     # console errors, failed requests, validation messages of ONE tab.
     (re.compile(rf"^/sessions/{_SEGMENT}/diagnostics/?$"), {"GET"}),

@@ -30,6 +30,7 @@ class TabDiagnosticsBuffer:
     page_errors: list[dict[str, Any]] = field(default_factory=list)
     request_failures: list[dict[str, Any]] = field(default_factory=list)
     response_errors: list[dict[str, Any]] = field(default_factory=list)
+    network_requests: list[dict[str, Any]] = field(default_factory=list)
 
 
 def bounded_append(items: list[Any], value: Any, limit: int = DEFAULT_RING_LIMIT) -> None:

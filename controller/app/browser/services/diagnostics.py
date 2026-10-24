@@ -92,6 +92,20 @@ class BrowserDiagnosticsService:
     ) -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if getattr(session, "tab_scoped", False) is True:
+                real = unwrap_session(session)
+                buf = get_buffer(real, session.tab_id)
+                entries = list(reversed(buf.network_requests))
+                if method:
+                    entries = [item for item in entries if item.get("method", "").upper() == method.upper()]
+                if url_contains:
+                    entries = [item for item in entries if url_contains in item.get("url", "")]
+                return {
+                    "session": await self.manager._session_summary(session),
+                    "enabled": True,
+                    "entries": entries[:limit],
+                    "summary": {"total": len(buf.network_requests)},
+                }
             inspector = session.network_inspector
             if inspector is None:
                 return {
@@ -118,7 +132,7 @@ class BrowserDiagnosticsService:
         session.attached_pages.add(page)
         self._navigation_ids[page] = uuid4().hex
         page.on("framenavigated", lambda frame: self._on_navigation(session, page, frame))
-        page.on("request", lambda request: self._on_request(page, request))
+        page.on("request", lambda request: self._on_request(session, page, request))
         page.on("requestfinished", lambda request: self._request_scopes.pop(request, None))
 
         page.on("console", lambda message: self._on_console(session, page, message))
@@ -159,15 +173,29 @@ class BrowserDiagnosticsService:
         buf = get_buffer(session, tab_id_for(session, page))
         # A stable tab ID can be rebound to another Page (popup follow).
         if getattr(buf, "_navigation_id", None) != navigation_id:
-            for entries in (buf.console, buf.page_errors, buf.request_failures, buf.response_errors):
+            for entries in (
+                buf.console, buf.page_errors, buf.request_failures, buf.response_errors,
+                buf.network_requests,
+            ):
                 entries.clear()
             buf._navigation_id = navigation_id
         return buf
 
-    def _on_request(self, page: "Page", request: Any) -> None:
+    def _on_request(self, session: "BrowserSession", page: "Page", request: Any) -> None:
         navigation_id = self._navigation_ids.get(page)
         if navigation_id is not None:
             self._request_scopes[request] = (weakref.ref(page), navigation_id)
+            buf = self._scope_buffer(session, page, navigation_id)
+            if buf is not None:
+                from ...pii_scrub import scrub_text
+
+                _tab_bounded_append(buf.network_requests, {
+                    "method": str(getattr(request, "method", "GET") or "GET").upper(),
+                    "url": scrub_text(str(getattr(request, "url", "") or "")).text,
+                    "resource_type": str(getattr(request, "resource_type", "other") or "other"),
+                    "status": None,
+                    "failed": False,
+                })
 
     def _request_navigation(self, page: "Page", request: Any) -> str | None:
         scope = self._request_scopes.get(request)
@@ -216,6 +244,16 @@ class BrowserDiagnosticsService:
             if self._navigation_ids.get(page) != navigation_id:
                 return
             status = response.status
+            buf = self._scope_buffer(session, page, navigation_id)
+            if buf is not None:
+                from ...pii_scrub import scrub_text
+
+                request = getattr(response, "request", None)
+                request_url = scrub_text(str(getattr(request, "url", "") or response.url)).text
+                for entry in reversed(buf.network_requests):
+                    if entry.get("url") == request_url and entry.get("status") is None:
+                        entry["status"] = status
+                        break
             if status < 400:
                 return
             request = getattr(response, "request", None)

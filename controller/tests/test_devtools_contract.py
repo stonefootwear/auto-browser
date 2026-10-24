@@ -4,37 +4,21 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import pytest
+from fastapi import FastAPI
 from playwright.async_api import async_playwright
 
-from app.browser_manager import BrowserManager, BrowserSession, _scrub_script_result
+from app.browser.tab_view import bind_tab, set_tab_owner
+from app.browser_manager import BrowserManager, BrowserSession
 from app.config import Settings
+from app.middleware.tab_scope import TabScopeMiddleware
+from app.routes.session_diagnostics import create_session_diagnostics_router
+from app.routes.sessions import create_sessions_router
 from app.utils import UTC
 
 
-def test_script_results_remove_actual_runtime_secret_values() -> None:
-    result = _scrub_script_result(
-        {
-            "cookie": "session=raw-cookie-value; ok=true",
-            "nested": {"password": "raw-password"},
-            "safe": 42,
-        },
-        ("raw-cookie-value", "raw-password"),
-    )
-    assert "raw-cookie-value" not in result["cookie"]
-    assert result["nested"]["password"] == "[REDACTED]"
-    assert result["safe"] == 42
-
-
-def test_script_result_redaction_is_data_based_not_expression_keyword_based() -> None:
-    result = _scrub_script_result(
-        {"title": "Public dashboard", "count": 3},
-        ("actual-runtime-secret",),
-    )
-    assert result == {"title": "Public dashboard", "count": 3}
-
-
-async def test_real_chromium_evaluate_is_read_only_and_redacts_runtime_values() -> None:
+async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is_projected() -> None:
     with tempfile.TemporaryDirectory(prefix="devtools-eval-") as folder:
         root = Path(folder)
         settings = Settings(
@@ -62,11 +46,13 @@ async def test_real_chromium_evaluate_is_read_only_and_redacts_runtime_values() 
                 pytest.skip(f"chromium cannot launch here: {exc}")
             try:
                 context = await browser.new_context()
-                page = await context.new_page()
-                await page.set_content(
-                    '<title>Public dashboard</title>'
-                    '<input aria-label="account" value="actual-runtime-secret">'
-                    '<script>window.sideEffectCount = 0</script>'
+                owner_page = await context.new_page()
+                await owner_page.goto(
+                    "data:text/html,<title>Owner secret tab</title><p>owner-only-value</p>"
+                )
+                employee_page = await context.new_page()
+                await employee_page.goto(
+                    "data:text/html,<title>Employee tab</title><p>employee-visible</p>"
                 )
                 artifact_dir = root / "artifacts" / "real-eval"
                 artifact_dir.mkdir(parents=True)
@@ -75,7 +61,7 @@ async def test_real_chromium_evaluate_is_read_only_and_redacts_runtime_values() 
                     name="real-eval",
                     created_at=datetime.now(UTC),
                     context=context,
-                    page=page,
+                    page=owner_page,
                     browser=browser,
                     artifact_dir=artifact_dir,
                     auth_dir=root / "auth",
@@ -85,15 +71,56 @@ async def test_real_chromium_evaluate_is_read_only_and_redacts_runtime_values() 
                 )
                 session.driver_epoch = manager._driver_epoch
                 manager.sessions[session.id] = session
+                employee_tab = "t-0123456789ab"
+                bind_tab(session, employee_page, employee_tab)
+                set_tab_owner(session, employee_tab, "emad")
+                manager._attach_page_listeners(owner_page, session)
+                manager._attach_page_listeners(employee_page, session)
 
-                result = await manager.evaluate_script(
-                    session.id,
-                    "({title: document.title, value: document.querySelector('input').value})",
-                )
-                assert result == {"title": "Public dashboard", "value": "[REDACTED]"}
+                app = FastAPI()
+                app.add_middleware(TabScopeMiddleware)
+                app.include_router(create_sessions_router(manager=manager))
+                app.include_router(create_session_diagnostics_router(manager=manager, settings=settings))
+                headers = {"X-Tab-Id": employee_tab}
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://controller"
+                ) as client:
+                    snapshot = await client.get(f"/sessions/{session.id}/snapshot", headers=headers)
+                    assert snapshot.status_code == 200
+                    assert snapshot.json()["url"] == employee_page.url
+                    assert "employee-visible" in snapshot.json()["text"]
+                    assert "owner-only-value" not in str(snapshot.json())
 
-                with pytest.raises(ValueError, match="side effects"):
-                    await manager.evaluate_script(session.id, "window.sideEffectCount = 1")
-                assert await page.evaluate("window.sideEffectCount") == 0
+                    evaluated = await client.post(
+                        f"/sessions/{session.id}/actions/evaluate-script",
+                        headers=headers,
+                        json={"expression": "document.readyState"},
+                    )
+                    assert evaluated.status_code == 200
+                    assert evaluated.json() == "complete"
+
+                    refused = await client.post(
+                        f"/sessions/{session.id}/actions/evaluate-script",
+                        headers=headers,
+                        json={"expression": "document.querySelector('p').textContent.slice(0, 3)"},
+                    )
+                    assert refused.status_code == 400
+                    assert "trusted browser diagnostic projections" in refused.json()["detail"]
+
+                    waited = await client.post(
+                        f"/sessions/{session.id}/actions/wait-for",
+                        headers=headers,
+                        json={"text": "employee-visible", "timeout_ms": 1000},
+                    )
+                    assert waited.status_code == 200
+                    assert waited.json()["url"] == employee_page.url
+
+                    network = await client.get(
+                        f"/sessions/{session.id}/network-log", headers=headers,
+                    )
+                    assert network.status_code == 200
+                    assert network.json()["session"]["current_url"] == employee_page.url
+                    assert "owner-only-value" not in str(network.json())
+
             finally:
                 await browser.close()

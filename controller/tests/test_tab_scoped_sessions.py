@@ -796,6 +796,10 @@ class TabScopeMiddlewareTests(unittest.TestCase):
         scoped = [
             ("GET", "/sessions/s1/observe"),
             ("POST", "/sessions/s1/observe"),
+            ("GET", "/sessions/s1/snapshot"),
+            ("POST", "/sessions/s1/actions/evaluate-script"),
+            ("POST", "/sessions/s1/actions/wait-for"),
+            ("GET", "/sessions/s1/network-log"),
             ("POST", "/sessions/s1/screenshot"),
             *[("POST", f"/sessions/s1/actions/{op}") for op in (
                 "navigate", "click", "type", "type-focused", "press", "dialog", "scroll", "upload", "hover",
