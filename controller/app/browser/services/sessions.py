@@ -1523,10 +1523,9 @@ class BrowserSessionService:
                 )
             page.set_default_timeout(manager.settings.action_timeout_ms)
         except Exception:
-            # browser-node now holds a lease for this generation: give it back
-            # exactly once, or the profile would stay open with nobody on it.
-            session.persistent_profile_released = True
-            await manager.persistent_profiles.close(handle.name, generation=handle.generation)
+            # reattach_only acquired a link to the owner's already-running
+            # profile, not its lifetime. A failed attachment must not close it.
+            # recover_dead_session retires our stale record with keep_profile_open.
             raise
         if session.network_inspector is not None:
             session.network_inspector.detach()

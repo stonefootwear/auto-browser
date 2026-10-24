@@ -265,6 +265,26 @@ class DeadLinkRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(session.id, self.manager.sessions)
         self.assertIs(self.manager.playwright, self.new_driver)
 
+    async def test_failed_cdp_attachment_retires_record_without_closing_running_profile(self) -> None:
+        self.manager.playwright = self.new_driver  # type: ignore[assignment]
+        session = self._session(persistent=True, browser=FakeBrowser(connected=False))
+        self._stub_reattach()
+        self.manager.runtime.attach_persistent_context = AsyncMock(  # type: ignore[method-assign]
+            side_effect=TimeoutError("CDP attachment timed out"),
+        )
+
+        await self.manager.session_lifecycle.reap_dead_sessions()
+
+        self.manager.persistent_profiles.open.assert_awaited_once_with(
+            "owner-default", owner="tenant", adopt_unmarked=True,
+            context_kwargs={"locale": "ar-EG"}, reattach_only=True,
+        )
+        self.manager.persistent_profiles.close.assert_not_awaited()
+        self.assertNotIn(session.id, self.manager.sessions)
+        self.assertTrue(session.persistent_profile_released)
+        self.assertEqual(self.manager.session_store.upsert.await_args.args[0].status, "interrupted")
+        self.async_playwright.assert_not_called()
+
     async def test_cdp_drop_reattaches_without_restarting_a_live_driver(self) -> None:
         self.manager.playwright = self.new_driver  # type: ignore[assignment]
         session = self._session(persistent=True, browser=FakeBrowser(connected=False))
