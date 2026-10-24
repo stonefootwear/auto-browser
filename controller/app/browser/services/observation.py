@@ -321,6 +321,7 @@ class BrowserObservationService:
         read_only: bool = False,
     ) -> dict[str, Any]:
         from .dialogs import BrowserDialogService
+        from .sessions import recorded_dialog
 
         if read_only:
             real = unwrap_session(session)
@@ -338,7 +339,7 @@ class BrowserObservationService:
             )
         if not read_only:
             dialogs.heal_active_page(session)
-        open_dialog = await dialogs.open_dialog(session)
+        open_dialog = recorded_dialog(session)
         if open_dialog is not None:
             # The tab is blocked by a JavaScript dialog: every page read would
             # hang until it is answered, so report the dialog itself instead.

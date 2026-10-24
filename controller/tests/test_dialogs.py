@@ -10,14 +10,28 @@ action are answered automatically -- and only when harmless.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
+import http.server
+import json
+import tempfile
+import threading
 import time
 import unittest
 import weakref
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from app.action_errors import BrowserActionError
 from app.browser.services.diagnostics import BrowserDiagnosticsService
 from app.browser.services.dialogs import BrowserDialogService, decide
+from app.browser.tab_scope import current_tab_id
+from app.browser.tab_view import tab_id_for
+from app.browser_manager import BrowserManager, BrowserSession
+from app.config import Settings
+from app.utils import UTC
 
 
 class FakeDialog:
@@ -299,3 +313,126 @@ class PipelineDialogGateTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BrowserActionError):
             await BrowserActionPipeline().run(context)
         self.assertEqual(session.agent_dialog_grace_until, 0.0)
+
+
+class PersistentPromptDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_two_clients_keep_prompt_and_release_action_for_normal_answer(self) -> None:
+        """The primary persistent client retains the prompt; CDP dispatch must return."""
+        from playwright.async_api import async_playwright
+
+        with tempfile.TemporaryDirectory(prefix="dialog-dispatch-") as folder:
+            root = Path(folder)
+            site = root / "site"
+            site.mkdir()
+            (site / "index.html").write_text(
+                '<title>persistent-prompt</title><button id="prompt" onclick="'
+                'window.clicks=(window.clicks||0)+1;'
+                "document.querySelector('#result').textContent=prompt('Your name?', '');"
+                '">prompt happen</button><p id="result"></p>', encoding="utf-8",
+            )
+
+            class Handler(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, *_args) -> None:
+                    pass
+
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), functools.partial(Handler, directory=str(site)),
+            )
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                async with async_playwright() as playwright:
+                    profile = root / "profile"
+                    primary = await playwright.chromium.launch_persistent_context(
+                        str(profile), headless=True, args=["--remote-debugging-port=0"],
+                    )
+                    primary.on("dialog", lambda _dialog: None)  # browser-node's actual ownership rule
+                    endpoint = (profile / "DevToolsActivePort").read_text().splitlines()
+                    browser = await playwright.chromium.connect_over_cdp(
+                        f"http://127.0.0.1:{endpoint[0]}", timeout=5000,
+                    )
+                    manager = BrowserManager(Settings(
+                        _env_file=None, ALLOWED_HOSTS="127.0.0.1", WITNESS_ENABLED=False,
+                        ENABLE_TRACING=False, PERCEPTION_PRESET_DEFAULT="text",
+                        BROWSER_ACTION_TIMEOUT_SECONDS=4, BROWSER_CALL_TIMEOUT_SECONDS=2,
+                        SESSION_WATCHDOG_INTERVAL_SECONDS=0.05,
+                        **{name: str(root / name.lower()) for name in (
+                            "ARTIFACT_ROOT", "AUTH_ROOT", "UPLOAD_ROOT", "APPROVAL_ROOT",
+                            "AUDIT_ROOT", "WITNESS_ROOT", "SESSION_STORE_ROOT",
+                        )},
+                    ))
+                    manager.playwright = playwright
+                    await manager.audit.startup()
+                    await manager.witness.startup()
+                    context = browser.contexts[0]
+                    owner_page = context.pages[0]
+                    page = await context.new_page()
+                    await page.goto(f"http://127.0.0.1:{server.server_port}/index.html")
+                    artifact_dir = root / "artifacts" / "prompt"
+                    artifact_dir.mkdir(parents=True)
+                    session = BrowserSession(
+                        id="prompt", name="prompt", created_at=datetime.now(UTC),
+                        context=context, page=owner_page, browser=browser,
+                        artifact_dir=artifact_dir, auth_dir=root / "auth", upload_dir=root / "uploads",
+                        takeover_url="", trace_path=artifact_dir / "trace.zip",
+                    )
+                    session.driver_epoch = manager._driver_epoch
+                    manager.sessions[session.id] = session
+                    manager._attach_page_listeners(owner_page, session)
+                    manager._attach_page_listeners(page, session)
+                    token = current_tab_id.set(tab_id_for(session, page))
+                    watchdog = asyncio.create_task(manager._session_watchdog_loop())
+                    try:
+                        # Cache metadata through the ordinary summary before the modal.
+                        view = await manager.get_session(session.id)
+                        self.assertEqual((await manager._session_summary(view))["title"], "persistent-prompt")
+                        started = time.monotonic()
+                        result = await asyncio.wait_for(
+                            manager.click(session.id, selector="#prompt", pace="fast"), timeout=3,
+                        )
+                        self.assertLess(time.monotonic() - started, 3)
+                        self.assertEqual(result["status"], "dialog_open")
+                        self.assertFalse(result["verification"]["verified"])
+                        self.assertFalse(result["retryable"])
+                        self.assertTrue(result["action_may_have_executed"])
+                        self.assertEqual(result["after"]["open_dialog"]["type"], "prompt")
+                        self.assertFalse(view.lock.locked())
+                        self.assertIs(session.page, owner_page)
+
+                        # Pending-dialog reads must not send renderer work at all.
+                        with patch.object(page, "evaluate", new=AsyncMock(side_effect=AssertionError("DOM read"))), \
+                             patch.object(page, "title", new=AsyncMock(side_effect=AssertionError("title read"))), \
+                             patch.object(page, "screenshot", new=AsyncMock(side_effect=AssertionError("screenshot"))):
+                            observed = await asyncio.wait_for(manager.observe(session.id, preset="text"), 0.5)
+                            self.assertEqual(observed["open_dialog"]["message"], "Your name?")
+                            self.assertEqual(observed["session"]["title"], "persistent-prompt")
+                            # A recorded modal timeout remains a dialog, never a dead link.
+                            with self.assertRaises(BrowserActionError) as raised:
+                                await manager.session_lifecycle.guarded(
+                                    view, asyncio.sleep(1), what="observe", timeout=0.01,
+                                )
+                            self.assertEqual(raised.exception.code, "dialog_open")
+                            await asyncio.sleep(0.1)
+                            self.assertIsNone(session.unresponsive_reason)
+                            self.assertIs(manager.sessions[session.id], session)
+                            self.assertEqual(session.reattach_count, 0)
+                        handled = await asyncio.wait_for(
+                            manager.handle_dialog(session.id, accept=True, prompt_text="اختبار فريق"), 2,
+                        )
+                        self.assertTrue(handled["handled"])
+                        observed = await manager.observe(session.id, preset="text")
+                        self.assertIsNone(observed["open_dialog"])
+                        self.assertIn("اختبار فريق", observed["text_excerpt"])
+                        self.assertEqual(await page.evaluate("window.clicks"), 1)
+                        events = [json.loads(line) for line in
+                                  (artifact_dir / "actions.jsonl").read_text(encoding="utf-8").splitlines()]
+                        self.assertEqual([(event["action"], event["status"]) for event in events], [("click", "pending")])
+                    finally:
+                        current_tab_id.reset(token)
+                        watchdog.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await watchdog
+                        await browser.close()  # CDP client only
+                        await primary.close()  # disposable fixture profile only
+            finally:
+                server.shutdown()
+                server.server_close()
