@@ -49,6 +49,17 @@ RENDERER_RECOVERY_MAX_ATTEMPTS = 3
 REATTACH_NEW_PAGE_TIMEOUT_SECONDS = 10
 
 
+def recorded_dialog(session: Any, page: Any = None) -> dict[str, Any] | None:
+    """Read the listener's modal state without calling the blocked renderer."""
+    target = session.page if page is None else page
+    if _is_closed(target):
+        return None
+    entry = getattr(session, "open_dialogs", {}).get(target)
+    if entry is None or entry[1].get("outcome") != "open":
+        return None
+    return dict(entry[1])
+
+
 class BrowserSessionService:
     """Encapsulates live session lifecycle and durable session summaries."""
 
@@ -1114,6 +1125,14 @@ class BrowserSessionService:
         try:
             return await asyncio.wait_for(awaitable, timeout)
         except asyncio.TimeoutError:
+            dialog = recorded_dialog(session)
+            if dialog is not None and session_connection_problem(self.manager, session) is None:
+                # A modal is an expected page wait, not a dead browser link.
+                raise BrowserActionError(
+                    "A dialog is open; answer it before continuing. Do not repeat the action.",
+                    code="dialog_open", action=what, status_code=423, retryable=False,
+                    url=getattr(session.page, "url", None), details={"dialog": dialog},
+                ) from None
             session.unresponsive_reason = f"{what} did not answer within {timeout:.0f}s"
             logger.error("session %s: %s -- re-attaching", session.id, session.unresponsive_reason)
             self.schedule_reap()
@@ -1744,8 +1763,17 @@ class BrowserSessionService:
         is_closed = getattr(page, "is_closed", None)
         if callable(is_closed) and is_closed():
             return "", "", False
+        real = unwrap_session(session)
+        titles = real.metadata.setdefault("page_titles", {})
+        key = real.tab_ids.get(page, str(id(page)))
+        # GET /sessions is also used by the broker before a dialog action.
+        # A title request here must not block that action behind the modal.
+        if any(recorded_dialog(real, candidate) is not None for candidate in list(real.open_dialogs)):
+            return page.url, titles.get(key, ""), True
         try:
-            return page.url, await page.title(), True
+            title = await page.title()
+            titles[key] = title
+            return page.url, title, True
         except Exception as exc:
             # Not only PlaywrightError: a dead driver raises a plain
             # Exception/RuntimeError here, which used to turn every

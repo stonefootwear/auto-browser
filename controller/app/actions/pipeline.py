@@ -194,6 +194,8 @@ class BrowserActionPipeline:
                 url=context.session.page.url,
                 details=details,
             ) from exc
+        if context.target.get("dialog") is not None:
+            return await self._record_pending_dialog(context, witness_state)
         return await self._record_success(context, witness_state)
 
     async def _diagnostics_digest(self, context: ActionRunContext) -> dict[str, Any] | None:
@@ -243,7 +245,8 @@ class BrowserActionPipeline:
             await manager._ensure_witness_remote_ready(session, action=context.action_name)
         if witness_state.outcome.should_block:
             raise PermissionError(witness_state.outcome.block_reason or "Witness policy blocked this action")
-        await context.operation()
+        if await self._dispatch_operation(context):
+            return
         dialogs = _dialogs(manager)
         if dialogs is not None and context.action_name != "wait":
             followed = await dialogs.follow_popup(session)
@@ -252,7 +255,9 @@ class BrowserActionPipeline:
             if dialogs.heal_active_page(session):
                 context.target["returned_to_opener"] = True
         if dialogs is not None:
-            open_dialog = await dialogs.open_dialog(session)
+            from ..browser.services.sessions import recorded_dialog
+
+            open_dialog = recorded_dialog(session)
             if open_dialog is not None:
                 # The page is blocked until the dialog is answered: report it and
                 # stop here (every probe below would hang on it).
@@ -273,6 +278,70 @@ class BrowserActionPipeline:
                 retryable=False,
                 details=challenge,
             )
+
+    async def _dispatch_operation(self, context: ActionRunContext) -> bool:
+        """A retained modal ends this await, never repeats or answers the input."""
+        from ..browser.services.sessions import recorded_dialog
+
+        page = context.session.page
+        if _dialogs(context.manager) is None or not hasattr(page, "remove_listener"):
+            await context.operation()
+            return False
+        events: asyncio.Queue[Any] = asyncio.Queue()
+        listener = events.put_nowait
+
+        async def wait_for_retained_dialog() -> dict[str, Any]:
+            while True:
+                dialog = await events.get()
+                # The existing listener registered first schedules _on_dialog.
+                # Let it decide/log; this dispatcher never duplicates that policy.
+                await asyncio.sleep(0)
+                entry = context.session.open_dialogs.get(page)
+                if entry is not None and entry[0] is dialog:
+                    record = recorded_dialog(context.session, page)
+                    if record is not None:
+                        return record
+
+        page.on("dialog", listener)
+        waiting = asyncio.create_task(wait_for_retained_dialog())
+        operation = asyncio.create_task(context.operation())
+        try:
+            done, _ = await asyncio.wait((operation, waiting), return_when=asyncio.FIRST_COMPLETED)
+            if waiting in done:
+                context.target["dialog"] = waiting.result()
+                return True
+            await operation
+            record = recorded_dialog(context.session, page)
+            if record is not None:
+                context.target["dialog"] = record
+                return True
+            return False
+        finally:
+            page.remove_listener("dialog", listener)
+            # Cancel only our local wait; the dispatched pointer/key event is
+            # not undone and must never be replayed after answering the modal.
+            for task in (operation, waiting):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(operation, waiting, return_exceptions=True)
+
+    async def _record_pending_dialog(
+        self, context: ActionRunContext, witness_state: ActionWitnessState,
+    ) -> dict[str, Any]:
+        after = await context.manager._observation_payload(context.session, limit=20, read_only=True)
+        await self._record_terminal_event(
+            context, witness_state, status="pending", after=after,
+            error={"code": "dialog_open", "action_may_have_executed": True},
+            approval_status=witness_state.witness_context.get("approval_status"),
+        )
+        return {
+            "action": context.action_name, "action_class": context.manager._action_class(context.action_name),
+            "status": "dialog_open", "pending": True,
+            "action_may_have_executed": True, "retryable": False,
+            "session": after["session"], "before": witness_state.before, "after": after,
+            "target": context.target,
+            "verification": {"verified": False, "signals": ["dialog_open"], "status": "pending"},
+        }
 
     async def _handle_policy_block(
         self,
@@ -341,7 +410,7 @@ class BrowserActionPipeline:
         status: str,
         after: dict[str, Any],
         error: Any,
-        approval_status: str,
+        approval_status: str | None,
     ) -> None:
         manager = context.manager
         session = context.session
