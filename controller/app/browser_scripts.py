@@ -180,6 +180,40 @@ INTERACTABLES_SCRIPT = r"""
     return String(raw).replace(/\s+/g, ' ').trim().slice(0, 160);
   }
 
+  function activePanelContext(el) {
+    // Bind an editor to the semantic panel and header it actually belongs to.  This is a
+    // structural projection, not a page-wide text search: a matching name in a sidebar or
+    // another list cannot become the identity of the active editor's conversation.
+    const panel = el.closest('#main, main, [role="main"]');
+    if (!panel) return null;
+    const header = panel.querySelector(':scope > header') || panel.querySelector('header');
+    if (!header || !isPainted(header)) return null;
+    const key = (node) => ({
+      tag: node.tagName.toLowerCase(),
+      id: node.id || null,
+      role: node.getAttribute('role'),
+      testid: node.getAttribute('data-testid'),
+    });
+    const labels = new Set();
+    const stableIds = new Set();
+    for (const node of [header, ...header.querySelectorAll('[title], [aria-label], [data-id]')]) {
+      for (const attr of ['title', 'aria-label']) {
+        const value = String(node.getAttribute(attr) || '').replace(/\s+/g, ' ').trim();
+        if (value && value.length <= 160) labels.add(value);
+      }
+      for (const attr of ['data-id']) {
+        const value = String(node.getAttribute(attr) || '').trim();
+        if (value && value.length <= 300) stableIds.add(value);
+      }
+    }
+    return {
+      panel: key(panel),
+      header: key(header),
+      header_labels: [...labels].slice(0, 20),
+      stable_ids: [...stableIds].slice(0, 20),
+    };
+  }
+
   const selector = [
     'a',
     'button',
@@ -223,6 +257,7 @@ INTERACTABLES_SCRIPT = r"""
         ? Boolean(el.checked)
         : (el.hasAttribute('aria-checked') ? el.getAttribute('aria-checked') === 'true' : null),
       href: el.href || null,
+      active_panel_context: activePanelContext(el),
       in_active_dialog: Boolean(dialog),
       dialog_label: dialog ? getLabel(dialog) : null,
       bbox: {
