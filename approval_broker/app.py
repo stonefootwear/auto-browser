@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -67,11 +67,23 @@ ALLOWED_ACTIONS = frozenset({
     # scan script -- no JS eval is ever exposed to the caller.
     "dom_query",
 })
+MCP_EXPOSED_ACTIONS = ALLOWED_ACTIONS - {
+    "click_at", "type", "type_focused", "scroll", "wait", "dom_query",
+    "press", "navigate", "dialog",
+}
 # Read-only capture of the caller's own tab, for vision (browser_see). Maps to
 # controller POST /sessions/{id}/screenshot -- a distinct REST path from the
 # generic /actions/{operation} used by ALLOWED_ACTIONS, so it gets its own
 # branch in operation_request() below, same as TAB_OPERATIONS.
 SCREENSHOT_OPERATIONS = frozenset({"screenshot"})
+# Chrome-DevTools-compatible operations added for the employee bridge. They
+# still pass through the same owner-session grant and employee tab binding as
+# every legacy broker call; none exposes the browser node's CDP socket.
+DEVTOOLS_OPERATIONS = frozenset({
+    "take_snapshot", "fill", "press_key", "navigate_page", "wait_for",
+    "handle_dialog", "take_screenshot", "evaluate_script",
+    "list_network_requests", "list_pages", "select_page",
+})
 # Controller error codes whose meaning an agent needs to act on (answer the
 # dialog, hand a captcha to the owner). Only the code and the dialog's own
 # type/text are relayed -- never the rest of the controller's error body.
@@ -1095,9 +1107,98 @@ def create_app(
             method, path, body, headers = operation_request(grant.session_id, operation, dict(arguments))
             return await upstream(method, path, body, headers=headers or None)
 
+    def validate_mcp_action(operation: str, arguments: dict[str, Any]) -> None:
+        """The model-visible bridge accepts UID actions only.
+
+        Legacy direct request routes remain compatible for the owner UI during
+        the coordinated rollout, but they are omitted from MCP discovery and
+        cannot smuggle selectors or coordinates through an exposed action.
+        """
+        if operation in {"click", "hover"}:
+            visible = {key: value for key, value in arguments.items() if key != "tab_id"}
+            if set(visible) - {"element_id", "pace"}:
+                raise HTTPException(400, f"{operation} takes only a snapshot uid and pace")
+            uid = visible.get("element_id")
+            if not isinstance(uid, str) or not re.fullmatch(r"op-[A-Za-z0-9]{4,40}", uid):
+                raise HTTPException(400, f"{operation} requires a current snapshot uid")
+        if operation == "select_option":
+            visible = {key: value for key, value in arguments.items() if key != "tab_id"}
+            if set(visible) - {"element_id", "value", "label", "index"}:
+                raise HTTPException(400, "select_option takes a snapshot uid and one choice")
+            uid = visible.get("element_id")
+            choices = [key for key in ("value", "label", "index") if visible.get(key) is not None]
+            if (not isinstance(uid, str) or not re.fullmatch(r"op-[A-Za-z0-9]{4,40}", uid)
+                    or len(choices) != 1):
+                raise HTTPException(400, "select_option requires a current snapshot uid and one choice")
+
     def operation_request(
         session_id: str, operation: str, arguments: dict[str, Any],
     ) -> tuple[str, str, dict[str, Any] | None, dict[str, str]]:
+        if operation == "take_snapshot":
+            headers = _pop_tab_id(arguments)
+            if arguments:
+                raise HTTPException(400, "take_snapshot takes no arguments")
+            return "GET", f"/sessions/{session_id}/snapshot", None, headers
+        if operation == "fill":
+            headers = _pop_tab_id(arguments)
+            if set(arguments) - {"uid", "value", "pace", "sensitive"}:
+                raise HTTPException(400, "fill takes uid, value, pace and sensitive")
+            uid, value = arguments.get("uid"), arguments.get("value")
+            if not isinstance(uid, str) or not re.fullmatch(r"op-[A-Za-z0-9]{4,40}", uid):
+                raise HTTPException(400, "fill requires a current snapshot uid")
+            if not isinstance(value, str) or not value:
+                raise HTTPException(400, "fill requires a non-empty value")
+            body = {"element_id": uid, "text": value}
+            for key in ("pace", "sensitive"):
+                if key in arguments:
+                    body[key] = arguments[key]
+            return "POST", f"/sessions/{session_id}/actions/type", body, headers
+        if operation == "press_key":
+            operation = "press"
+        elif operation == "navigate_page":
+            operation = "navigate"
+        elif operation == "handle_dialog":
+            action = arguments.pop("action", None)
+            if action not in {"accept", "dismiss"}:
+                raise HTTPException(400, "handle_dialog action must be accept or dismiss")
+            arguments["accept"] = action == "accept"
+            operation = "dialog"
+        elif operation == "take_screenshot":
+            operation = "screenshot"
+        elif operation == "list_pages":
+            operation = "list_tabs"
+        elif operation == "select_page":
+            page_id = arguments.pop("page_id", None)
+            if arguments or not isinstance(page_id, int) or isinstance(page_id, bool):
+                raise HTTPException(400, "select_page requires integer page_id")
+            arguments["index"] = page_id
+            operation = "activate_tab"
+        if operation == "wait_for":
+            headers = _pop_tab_id(arguments)
+            if set(arguments) - {"text", "uid", "timeout_ms"}:
+                raise HTTPException(400, "wait_for takes text or uid and timeout_ms")
+            return "POST", f"/sessions/{session_id}/actions/wait-for", arguments, headers
+        if operation == "evaluate_script":
+            headers = _pop_tab_id(arguments)
+            expression = arguments.get("expression")
+            if set(arguments) != {"expression"} or not isinstance(expression, str):
+                raise HTTPException(400, "evaluate_script requires expression")
+            return "POST", f"/sessions/{session_id}/actions/evaluate-script", arguments, headers
+        if operation == "list_network_requests":
+            headers = _pop_tab_id(arguments)
+            if set(arguments) - {"limit", "method", "url_contains"}:
+                raise HTTPException(400, "list_network_requests takes limit, method and url_contains")
+            limit = arguments.get("limit", 100)
+            if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+                raise HTTPException(400, "list_network_requests limit must be 1..1000")
+            query = {"limit": limit}
+            for key in ("method", "url_contains"):
+                value = arguments.get(key)
+                if value is not None:
+                    if not isinstance(value, str) or len(value) > 500:
+                        raise HTTPException(400, f"list_network_requests invalid {key}")
+                    query[key] = value
+            return "GET", f"/sessions/{session_id}/network-log?{urlencode(query)}", None, headers
         if operation == "observe":
             headers = _pop_tab_id(arguments)
             if arguments:
@@ -1459,7 +1560,7 @@ def create_app(
     @app.get("/mcp/tools")
     async def list_tools(authorization: str | None = Header(default=None)):
         require_role(authorization, "agent")
-        return [{"name": f"browser.{name}"} for name in ("session_status", "request_access", "get_request", "complete", "observe", "diagnostics", "find_api_keys", *sorted(TAB_OPERATIONS), *sorted(FILE_OPERATIONS), *sorted(SCREENSHOT_OPERATIONS), *sorted(ALLOWED_ACTIONS))]
+        return [{"name": f"browser.{name}"} for name in ("session_status", "request_access", "get_request", "complete", "diagnostics", "find_api_keys", *sorted(DEVTOOLS_OPERATIONS), *sorted(TAB_OPERATIONS), *sorted(FILE_OPERATIONS), *sorted(MCP_EXPOSED_ACTIONS))]
 
     async def session_status() -> dict[str, str]:
         """Safe agent setup signal; deliberately unrelated to TOTP state."""
@@ -1508,6 +1609,7 @@ def create_app(
         operation = payload.name.removeprefix("browser.")
         if operation in FILE_OPERATIONS:
             return await file_operation(agent_grant(grant_id, authorization), operation, arguments)
+        validate_mcp_action(operation, arguments)
         return await operate(agent_grant(grant_id, authorization), operation, arguments)
 
     @app.post("/mcp")
@@ -1527,7 +1629,7 @@ def create_app(
                 },
             }
         if payload.method == "tools/list":
-            names = ("session_status", "request_access", "get_request", "complete", "observe", "diagnostics", "find_api_keys", *sorted(TAB_OPERATIONS), *sorted(FILE_OPERATIONS), *sorted(SCREENSHOT_OPERATIONS), *sorted(ALLOWED_ACTIONS))
+            names = ("session_status", "request_access", "get_request", "complete", "diagnostics", "find_api_keys", *sorted(DEVTOOLS_OPERATIONS), *sorted(TAB_OPERATIONS), *sorted(FILE_OPERATIONS), *sorted(MCP_EXPOSED_ACTIONS))
             return {
                 "jsonrpc": "2.0", "id": payload.id,
                 "result": {"tools": [
@@ -1586,6 +1688,7 @@ def create_app(
                 if operation in FILE_OPERATIONS:
                     result = await file_operation(agent_grant(request_id, authorization), operation, action_arguments)
                 else:
+                    validate_mcp_action(operation, action_arguments)
                     result = await operate(agent_grant(request_id, authorization), operation, action_arguments)
             import json
 

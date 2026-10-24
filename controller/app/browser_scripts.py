@@ -100,18 +100,25 @@ STEALTH_INIT_SCRIPT = r"""
 
 INTERACTABLES_SCRIPT = r"""
 (limit) => {
+  // A zero limit is the DevTools-style snapshot mode: return the complete
+  // accessibility/action surface, including controls below the fold. Ordinary
+  // observations keep their existing bounded, viewport-only behaviour.
+  const fullSnapshot = limit === 0;
   function isPainted(el) {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0
-      && rect.right > 0 && rect.bottom > 0
-      && rect.left < window.innerWidth && rect.top < window.innerHeight
+      && (fullSnapshot || (
+        rect.right > 0 && rect.bottom > 0
+        && rect.left < window.innerWidth && rect.top < window.innerHeight
+      ))
       && style.visibility !== 'hidden' && style.display !== 'none'
       && style.opacity !== '0' && !el.closest('[aria-hidden="true"]');
   }
 
   function isHitTestable(el) {
     if (!isPainted(el)) return false;
+    if (fullSnapshot) return true;
     const rect = el.getBoundingClientRect();
     const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
     const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
@@ -225,7 +232,7 @@ INTERACTABLES_SCRIPT = r"""
         height: Math.round(rect.height)
       }
     });
-    if (out.length >= limit) break;
+    if (!fullSnapshot && out.length >= limit) break;
   }
 
   // Custom dropdown/listbox/menu options: divs or spans with a click handler
@@ -268,7 +275,7 @@ INTERACTABLES_SCRIPT = r"""
     return containers;
   }
 
-  const OPTION_CAP = 60;
+  const OPTION_CAP = fullSnapshot ? Number.POSITIVE_INFINITY : 60;
   let optionCount = 0;
   outer:
   for (const container of optionContainers()) {
@@ -277,7 +284,7 @@ INTERACTABLES_SCRIPT = r"""
     );
     const candidates = items.length ? [...items] : [...container.querySelectorAll('*')].filter(isOptionLike);
     for (const el of candidates) {
-      if (out.length >= limit) break outer;
+      if (!fullSnapshot && out.length >= limit) break outer;
       if (seen.has(el) || !isHitTestable(el)) continue;
       seen.add(el);
       if (!el.dataset.operatorId) {
@@ -305,7 +312,7 @@ INTERACTABLES_SCRIPT = r"""
         list_option: true
       });
       optionCount += 1;
-      if (optionCount >= OPTION_CAP || out.length >= limit) break outer;
+      if (optionCount >= OPTION_CAP || (!fullSnapshot && out.length >= limit)) break outer;
     }
   }
 

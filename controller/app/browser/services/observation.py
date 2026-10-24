@@ -139,6 +139,56 @@ class BrowserObservationService:
             )
             return result
 
+    async def snapshot(self, session_id: str) -> dict[str, Any]:
+        """Return the complete UID-addressable page surface without screenshots.
+
+        Unlike ``observe``, this deliberately has no first-N control limit and
+        includes controls below the fold. ``data-operator-id`` values are stored
+        on the live DOM, so a UID remains stable until that DOM node is replaced.
+        """
+        session = await self.manager.get_session(session_id, read_only=True)
+        async with session.lock:
+            result = await self.manager.session_lifecycle.guarded(
+                session,
+                self._snapshot_payload(session),
+                what="snapshot",
+                timeout=self.manager.settings.browser_call_timeout_seconds,
+            )
+            return redact_api_keys(result)
+
+    async def _snapshot_payload(self, session: "BrowserSession") -> dict[str, Any]:
+        from .sessions import recorded_dialog
+
+        real = unwrap_session(session)
+        page = session.page
+        if (_is_closed(page) or (getattr(session, "tab_scoped", False)
+                and page_for_tab(real, session.tab_id, self.manager.tabs.pages(real), read_only=True) is not page)):
+            raise BrowserActionError(
+                "That tab is no longer open. List the tabs or open a new one.",
+                code="tab_gone", status_code=410, retryable=True,
+            )
+        open_dialog = recorded_dialog(session)
+        if open_dialog is not None:
+            return {
+                "url": page.url,
+                "title": "",
+                "text": "",
+                "controls": [],
+                "open_dialog": open_dialog,
+            }
+        raw = await page.evaluate(INTERACTABLES_SCRIPT, 0)
+        controls = raw.get("interactables") if isinstance(raw, dict) else raw
+        active_dialog = raw.get("active_dialog") if isinstance(raw, dict) else None
+        text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        return {
+            "url": page.url,
+            "title": await page.title(),
+            "text": text if isinstance(text, str) else "",
+            "controls": controls if isinstance(controls, list) else [],
+            "active_dialog": active_dialog,
+            "open_dialog": None,
+        }
+
     async def find_api_keys(self, session_id: str, provider: str) -> dict[str, Any]:
         """API keys of ONE known shape shown on the page -- or just copied by its "Copy" button.
 

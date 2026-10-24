@@ -135,15 +135,83 @@ def test_agent_can_list_and_switch_tabs_but_not_close_them(tmp_path: Path, clock
         assert client.post("/mcp/tools/call", headers=auth(AGENT), json={"name": "browser.list_tabs", "arguments": {"request_id": request_id}}).status_code == 200
         assert client.get("/mcp/tools", headers=auth(AGENT)).json() == [
             {"name": f"browser.{name}"} for name in (
-                "session_status", "request_access", "get_request", "complete", "observe", "diagnostics",
+                "session_status", "request_access", "get_request", "complete", "diagnostics",
                 "find_api_keys",
+                "evaluate_script", "fill", "handle_dialog", "list_network_requests", "list_pages",
+                "navigate_page", "press_key", "select_page", "take_screenshot", "take_snapshot", "wait_for",
                 "activate_tab", "list_tabs", "open_tab",
                 "download_file", "upload_file",
-                "screenshot",
-                "click", "click_at", "dialog", "dom_query", "go_back", "go_forward", "hover", "navigate", "press",
-                "reload", "scroll", "select_option", "type", "type_focused", "upload", "wait",
+                "click", "go_back", "go_forward", "hover", "reload", "select_option", "upload",
             )
         ]
+
+
+def test_devtools_contract_stays_grant_and_tab_scoped(tmp_path: Path, clock: list[float]) -> None:
+    active, calls = False, []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal active
+        payload = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, request.url.query.decode(), payload,
+                      request.headers.get("x-tab-id")))
+        if request.method == "GET" and request.url.path == "/sessions":
+            return httpx.Response(200, json=[{"id": "owner-1", "status": "active"}] if active else [])
+        if request.method == "POST" and request.url.path == "/sessions":
+            active = True
+            return httpx.Response(200, json={"id": "owner-1"})
+        return httpx.Response(200, json={"ok": True})
+
+    with TestClient(app_at(tmp_path, upstream)) as client:
+        secret = enroll(client, clock)
+        client.post(
+            "/owner/sessions", headers=auth(OWNER),
+            json={"start_url": "https://example.com", "totp_code": fresh(secret, clock)},
+        )
+        request_id = client.post(
+            "/requests", headers=auth(AGENT), json={"purpose": "devtools"}
+        ).json()["id"]
+        tab_id = "t-0123456789ab"
+
+        for name, arguments in (
+            ("take_snapshot", {"tab_id": tab_id}),
+            ("click", {"tab_id": tab_id, "element_id": "op-button1"}),
+            ("fill", {"tab_id": tab_id, "uid": "op-field1", "value": "hello"}),
+            ("wait_for", {"tab_id": tab_id, "uid": "op-field1", "timeout_ms": 5000}),
+            ("evaluate_script", {"tab_id": tab_id, "expression": "document.title"}),
+            ("list_network_requests", {"tab_id": tab_id, "limit": 25, "method": "POST"}),
+        ):
+            response = client.post(
+                "/mcp/tools/call", headers=auth(AGENT),
+                json={"name": f"browser.{name}", "arguments": {"request_id": request_id, **arguments}},
+            )
+            assert response.status_code == 200
+
+        guessed = client.post(
+            "/mcp/tools/call", headers=auth(AGENT),
+            json={
+                "name": "browser.click",
+                "arguments": {"request_id": request_id, "tab_id": tab_id, "selector": "text=Submit"},
+            },
+        )
+        assert guessed.status_code == 400
+
+        assert ("GET", "/sessions/owner-1/snapshot", "", None, tab_id) in calls
+        assert ("POST", "/sessions/owner-1/actions/type", "",
+                {"element_id": "op-field1", "text": "hello"}, tab_id) in calls
+        assert ("POST", "/sessions/owner-1/actions/click", "",
+                {"element_id": "op-button1"}, tab_id) in calls
+        assert ("POST", "/sessions/owner-1/actions/wait-for", "",
+                {"uid": "op-field1", "timeout_ms": 5000}, tab_id) in calls
+        assert ("POST", "/sessions/owner-1/actions/evaluate-script", "",
+                {"expression": "document.title"}, tab_id) in calls
+        assert ("GET", "/sessions/owner-1/network-log", "limit=25&method=POST", None, tab_id) in calls
+
+        # A direct call without the owner-session grant remains unavailable.
+        denied = client.post(
+            "/mcp/tools/call", headers=auth(AGENT),
+            json={"name": "browser.take_snapshot", "arguments": {}},
+        )
+        assert denied.status_code == 400
 
 
 def test_agent_can_open_a_new_tab_but_not_close_one(tmp_path: Path, clock: list[float]) -> None:
@@ -1247,9 +1315,11 @@ def test_diagnostics_and_dom_query_relay_tab_scoped_like_observe(tmp_path: Path,
         # No tab_id: still forwards, just without the header (like every other action).
         client.post(f"/requests/{grant}/actions/dom_query", headers=auth(AGENT), json={"arguments": {"css": "input"}})
         assert ("POST", "/sessions/owner-1/actions/dom-query", {"css": "input"}, None) in calls
-        # dom_query is now a listed tool, alongside diagnostics.
+        # The legacy bounded DOM query still works for current callers during rollout, but
+        # it is no longer discoverable now that the complete UID snapshot is the contract.
         names = {tool["name"] for tool in client.get("/mcp/tools", headers=auth(AGENT)).json()}
-        assert {"browser.diagnostics", "browser.dom_query"} <= names
+        assert "browser.diagnostics" in names
+        assert "browser.dom_query" not in names
 
 
 def test_a_failed_action_relays_its_bounded_diagnostics_digest(tmp_path: Path, clock: list[float]) -> None:

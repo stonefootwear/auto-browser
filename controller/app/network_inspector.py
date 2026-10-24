@@ -110,7 +110,17 @@ class NetworkInspector:
             items = [e for e in items if e.get("method", "").upper() == method.upper()]
         if url_contains:
             items = [e for e in items if url_contains in e.get("url", "")]
-        return list(reversed(items))[:limit]
+        from .pii_scrub import scrub_text
+
+        sanitized: list[dict[str, Any]] = []
+        for entry in list(reversed(items))[:limit]:
+            copy = dict(entry)
+            copy["url"] = scrub_text(str(copy.get("url") or "")).text
+            failure = copy.get("failure_text")
+            if isinstance(failure, str):
+                copy["failure_text"] = scrub_text(failure).text
+            sanitized.append(copy)
+        return sanitized
 
     async def _flush_pending(self) -> None:
         """Move all pending entries into the log as failed — called on detach."""
