@@ -11,16 +11,18 @@ import pytest
 from fastapi import FastAPI
 from playwright.async_api import async_playwright
 
-from app.browser.tab_view import bind_tab, set_tab_owner
-from app.browser_manager import BrowserManager, BrowserSession
-from app.config import Settings
-from app.middleware.tab_scope import TabScopeMiddleware
-from app.routes.session_diagnostics import create_session_diagnostics_router
-from app.routes.sessions import create_sessions_router
+from app.browser_scripts import INTERACTABLES_SCRIPT
 from app.utils import UTC
 
 
 async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is_projected() -> None:
+    from app.browser.tab_view import bind_tab, set_tab_owner
+    from app.browser_manager import BrowserManager, BrowserSession
+    from app.config import Settings
+    from app.middleware.tab_scope import TabScopeMiddleware
+    from app.routes.session_diagnostics import create_session_diagnostics_router
+    from app.routes.sessions import create_sessions_router
+
     with tempfile.TemporaryDirectory(prefix="devtools-eval-") as folder:
         root = Path(folder)
         settings = Settings(
@@ -177,3 +179,41 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
 
             finally:
                 await browser.close()
+
+
+async def test_real_chromium_snapshot_projects_navigation_and_effective_form_submit() -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content('''
+                <a href="https://example.test/account">Account link</a>
+                <div role="tab">Details tab</div>
+                <button type="button" aria-haspopup="menu" aria-expanded="false">Account menu</button>
+                <form id="settings"><button aria-expanded="false">Save settings</button></form>
+                <button form="settings" aria-haspopup="listbox">External submit</button>
+                <button id="changing" aria-expanded="false">Disclosure</button>
+            ''')
+            first = (await page.evaluate(INTERACTABLES_SCRIPT, 0))["interactables"]
+            controls = {row["label"]: row for row in first}
+            assert controls["Account link"]["href"] == "https://example.test/account"
+            assert controls["Details tab"]["role"] == "tab"
+            assert controls["Account menu"]["aria_haspopup"] == "menu"
+            assert controls["Account menu"]["aria_expanded"] == "false"
+            assert controls["Account menu"]["form_submit"] is False
+            assert controls["Save settings"]["type"] is None
+            assert controls["Save settings"]["form_submit"] is True
+            assert controls["External submit"]["form_submit"] is True
+            before = controls["Disclosure"]
+            assert before["form_submit"] is False
+            await page.evaluate("""() => {
+                const button = document.getElementById('changing');
+                button.setAttribute('aria-expanded', 'true');
+                document.getElementById('settings').append(button);
+            }""")
+            after = next(row for row in (await page.evaluate(INTERACTABLES_SCRIPT, 0))["interactables"]
+                         if row["element_id"] == before["element_id"])
+            assert after["label"] == before["label"] and after["type"] is None
+            assert after["aria_expanded"] == "true" and after["form_submit"] is True
+        finally:
+            await browser.close()
