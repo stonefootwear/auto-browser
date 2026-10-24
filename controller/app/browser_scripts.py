@@ -222,6 +222,7 @@ INTERACTABLES_SCRIPT = r"""
     'select',
     '[role="button"]',
     '[role="link"]',
+    '[role="tab"]',
     '[role="textbox"]',
     '[role="checkbox"]',
     '[role="radio"]',
@@ -257,6 +258,12 @@ INTERACTABLES_SCRIPT = r"""
         ? Boolean(el.checked)
         : (el.hasAttribute('aria-checked') ? el.getAttribute('aria-checked') === 'true' : null),
       href: el.href || null,
+      aria_haspopup: el.getAttribute('aria-haspopup'),
+      aria_expanded: el.getAttribute('aria-expanded'),
+      form_submit: Boolean(el.form && (
+        (el.tagName === 'BUTTON' && el.type === 'submit')
+        || (el.tagName === 'INPUT' && ['submit', 'image'].includes(el.type))
+      )),
       active_panel_context: activePanelContext(el),
       in_active_dialog: Boolean(dialog),
       dialog_label: dialog ? getLabel(dialog) : null,
@@ -336,6 +343,9 @@ INTERACTABLES_SCRIPT = r"""
         disabled: Boolean(el.getAttribute('aria-disabled') === 'true'),
         checked: el.hasAttribute('aria-checked') ? el.getAttribute('aria-checked') === 'true' : null,
         href: null,
+        aria_haspopup: el.getAttribute('aria-haspopup'),
+        aria_expanded: el.getAttribute('aria-expanded'),
+        form_submit: false,
         in_active_dialog: Boolean(dialog && dialog.contains(el)),
         dialog_label: dialog ? getLabel(dialog) : null,
         bbox: {
