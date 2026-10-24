@@ -40,27 +40,6 @@ ALLOWED_ACTIONS = frozenset({
     # Answer the JavaScript dialog (alert/confirm/prompt/leave-page) open on
     # the active tab -- controller POST /sessions/{id}/actions/dialog.
     "dialog",
-    # A human-pointer click at a page position instead of a resolved element
-    # (browser_see -> browser_click_at, when the target is icon-only or a text
-    # click failed twice). Maps to the SAME controller endpoint as "click"
-    # (/actions/click already accepts x/y -- see ClickRequest), but is kept a
-    # distinct action name here and validated to x/y/pace ONLY: never a
-    # selector or element_id, so a coordinate click can never silently become
-    # an element-targeted one through this channel.
-    "click_at",
-    # Insert text into whatever already has DOM focus -- no selector/element_id
-    # needed. For rich-text editors that never surface as a text field in
-    # observe() (Lexical-style contenteditable boxes: Google Flow's prompt box,
-    # ChatGPT, Canva, Notion-like editors), an agent clicks the box first
-    # (click / click_at) and then uses this instead of "type". Maps to the
-    # controller's own POST /sessions/{id}/actions/type-focused -- the same
-    # endpoint the owner's noVNC "type here" bridge already used
-    # (approval_broker owner_type above) -- kept tab-scoped via X-Tab-Id so an
-    # employee's call always lands in ITS tab, never the owner's active one
-    # (see controller/app/middleware/tab_scope.py TAB_SCOPED_ACTIONS). The
-    # controller applies the identical sensitive-field redaction as "type"
-    # (password/OTP inputs never get their text logged).
-    "type_focused",
     # Read-only CSS/text DOM query (the DevTools-style "raw view" -- see
     # browser.diagnostics below). Maps to POST /sessions/{id}/actions/dom-query
     # (see _ACTION_PATH_OVERRIDES); the controller runs a fixed, parameterised
@@ -68,7 +47,7 @@ ALLOWED_ACTIONS = frozenset({
     "dom_query",
 })
 MCP_EXPOSED_ACTIONS = ALLOWED_ACTIONS - {
-    "click_at", "type", "type_focused", "scroll", "wait", "dom_query",
+    "type", "scroll", "wait", "dom_query",
     "press", "navigate", "dialog",
 }
 # Read-only capture of the caller's own tab, for vision (browser_see). Maps to
@@ -122,7 +101,6 @@ _ACTION_PATH_OVERRIDES = {
     "select_option": "select-option",
     "go_back": "go-back",
     "go_forward": "go-forward",
-    "type_focused": "type-focused",
     "dom_query": "dom-query",
 }
 # Tab visibility/switching/opening lives at the controller's own REST paths (/tabs,
@@ -1108,12 +1086,15 @@ def create_app(
             return await upstream(method, path, body, headers=headers or None)
 
     def validate_mcp_action(operation: str, arguments: dict[str, Any]) -> None:
-        """The model-visible bridge accepts UID actions only.
-
-        Legacy direct request routes remain compatible for the owner UI during
-        the coordinated rollout, but they are omitted from MCP discovery and
-        cannot smuggle selectors or coordinates through an exposed action.
-        """
+        """Every agent bridge, discovered or direct, accepts UID actions only."""
+        if any(key in arguments for key in ("target", "selector", "x", "y")):
+            raise HTTPException(400, "Text, selector and coordinate targets are retired")
+        supported = (
+            ALLOWED_ACTIONS | DEVTOOLS_OPERATIONS | TAB_OPERATIONS
+            | SCREENSHOT_OPERATIONS | {"observe", "diagnostics", "find_api_keys"}
+        )
+        if operation not in supported:
+            raise HTTPException(404, "Tool unavailable")
         if operation in {"click", "hover"}:
             visible = {key: value for key, value in arguments.items() if key != "tab_id"}
             if set(visible) - {"element_id", "pace"}:
@@ -1121,6 +1102,15 @@ def create_app(
             uid = visible.get("element_id")
             if not isinstance(uid, str) or not re.fullmatch(r"op-[A-Za-z0-9]{4,40}", uid):
                 raise HTTPException(400, f"{operation} requires a current snapshot uid")
+        if operation == "type":
+            visible = {key: value for key, value in arguments.items() if key != "tab_id"}
+            if set(visible) - {"element_id", "text", "pace", "sensitive"}:
+                raise HTTPException(400, "type takes a snapshot uid and text")
+            uid, value = visible.get("element_id"), visible.get("text")
+            if not isinstance(uid, str) or not re.fullmatch(r"op-[A-Za-z0-9]{4,40}", uid):
+                raise HTTPException(400, "type requires a current snapshot uid")
+            if not isinstance(value, str) or not value:
+                raise HTTPException(400, "type requires non-empty text")
         if operation == "select_option":
             visible = {key: value for key, value in arguments.items() if key != "tab_id"}
             if set(visible) - {"element_id", "value", "label", "index"}:
@@ -1242,15 +1232,6 @@ def create_app(
             return "POST", f"/sessions/{session_id}/tabs/open", body, {}
         if operation in FILE_OPERATIONS:
             raise HTTPException(500, "File operations are not session-locked")
-        if operation == "click_at":
-            headers = _pop_tab_id(arguments)
-            if set(arguments) - {"x", "y", "pace"}:
-                raise HTTPException(400, "click_at takes only x, y and pace")
-            x, y = arguments.get("x"), arguments.get("y")
-            if isinstance(x, bool) or isinstance(y, bool) or not isinstance(x, (int, float)) \
-                    or not isinstance(y, (int, float)):
-                raise HTTPException(400, "click_at requires numeric x and y")
-            return "POST", f"/sessions/{session_id}/actions/click", arguments, headers
         if operation in SCREENSHOT_OPERATIONS:
             headers = _pop_tab_id(arguments)
             if set(arguments) - {"label"}:
@@ -1267,8 +1248,8 @@ def create_app(
             return "POST", f"/sessions/{session_id}/actions/{path}", arguments, headers
         raise HTTPException(404, "Tool unavailable")
 
-    _DOWNLOAD_KEYS = {"mode", "element_id", "selector", "url", "media_kind", "timeout_seconds", "pace"}
-    _ATTACH_KEYS = {"transfer_id", "element_id", "selector"}
+    _DOWNLOAD_KEYS = {"mode", "element_id", "url", "media_kind", "timeout_seconds", "pace"}
+    _ATTACH_KEYS = {"transfer_id", "element_id"}
 
     def owned_transfer(grant: Grant, transfer_id: Any) -> str:
         if not isinstance(transfer_id, str) or not _TRANSFER_ID_RE.fullmatch(transfer_id):
@@ -1303,7 +1284,13 @@ def create_app(
         tab_headers = _pop_tab_id(arguments)
         if operation == "download_file":
             if set(arguments) - _DOWNLOAD_KEYS or not isinstance(arguments.get("mode"), str):
-                raise HTTPException(400, "download_file takes mode and element_id/selector/url/media_kind/timeout_seconds/pace")
+                raise HTTPException(400, "download_file takes mode and element_id/url/media_kind/timeout_seconds/pace")
+            mode = arguments.get("mode")
+            uid = arguments.get("element_id")
+            if mode in {"click", "element"} and (
+                not isinstance(uid, str) or not re.fullmatch(r"op-[A-Za-z0-9]{4,40}", uid)
+            ):
+                raise HTTPException(400, "click and element downloads require a snapshot uid")
             wait = arguments.get("timeout_seconds", 120)
             if not isinstance(wait, (int, float)) or isinstance(wait, bool) or not 0 < wait <= 600:
                 raise HTTPException(400, "timeout_seconds must be a number up to 600")
@@ -1326,9 +1313,12 @@ def create_app(
             return result
         if operation == "upload_file":
             if set(arguments) - _ATTACH_KEYS:
-                raise HTTPException(400, "upload_file takes transfer_id and element_id/selector")
+                raise HTTPException(400, "upload_file takes transfer_id and element_id")
             transfer_id = owned_transfer(grant, arguments.get("transfer_id"))
-            body = {key: arguments[key] for key in ("element_id", "selector") if key in arguments}
+            uid = arguments.get("element_id")
+            if not isinstance(uid, str) or not re.fullmatch(r"op-[A-Za-z0-9]{4,40}", uid):
+                raise HTTPException(400, "upload_file requires a snapshot uid")
+            body = {"element_id": uid}
             async with grant.lock:
                 return await upstream(
                     "POST", f"/sessions/{grant.session_id}/files/{transfer_id}/attach", body,
@@ -1446,6 +1436,7 @@ def create_app(
         grant = agent_grant(grant_id, authorization)
         if action_name in FILE_OPERATIONS:
             return await file_operation(grant, action_name, payload.arguments)
+        validate_mcp_action(action_name, payload.arguments)
         return await operate(grant, action_name, payload.arguments)
 
     @app.get("/requests/{grant_id}/files/{transfer_id}")

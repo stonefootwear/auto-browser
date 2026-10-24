@@ -194,6 +194,26 @@ def test_devtools_contract_stays_grant_and_tab_scoped(tmp_path: Path, clock: lis
             },
         )
         assert guessed.status_code == 400
+        direct_text = client.post(
+            f"/requests/{request_id}/actions/click", headers=auth(AGENT),
+            json={"arguments": {"target": "Submit", "tab_id": tab_id}},
+        )
+        direct_coordinates = client.post(
+            f"/requests/{request_id}/actions/click_at", headers=auth(AGENT),
+            json={"arguments": {"x": 10, "y": 20, "tab_id": tab_id}},
+        )
+        focused_type = client.post(
+            f"/requests/{request_id}/actions/type_focused", headers=auth(AGENT),
+            json={"arguments": {"text": "hello", "tab_id": tab_id}},
+        )
+        assert direct_text.status_code == 400
+        assert direct_coordinates.status_code == 400
+        assert focused_type.status_code == 404
+        assert not [
+            call for call in calls
+            if call[1].endswith(("/actions/type-focused", "/actions/click"))
+            and call[3] != {"element_id": "op-button1"}
+        ]
 
         assert ("GET", "/sessions/owner-1/snapshot", "", None, tab_id) in calls
         assert ("POST", "/sessions/owner-1/actions/type", "",
