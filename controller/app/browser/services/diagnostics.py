@@ -8,11 +8,12 @@ import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from ...browser_scripts import VALIDATION_MESSAGES_SCRIPT
 from ...downloads import DownloadCaptureService
-from ...pii_scrub import PiiScrubber
+from ...pii_scrub import PiiScrubber, scrub_text
 from ...utils import UTC, spawn_background_task
 from ..tab_diagnostics import bounded_append as _tab_bounded_append
 from ..tab_diagnostics import get_buffer
@@ -36,6 +37,23 @@ _RESPONSE_BODY_SNIPPET_CHARS = 2000
 _DIAGNOSTIC_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
 
 
+def _network_metadata_url(value: str) -> str:
+    """Keep diagnostic host/path without credentials or URL-carried payloads."""
+    try:
+        if any(char.isspace() or ord(char) < 32 or char == "\\" for char in value):
+            return ""
+        parts = urlsplit(value)
+        host = parts.hostname
+        if parts.scheme not in {"http", "https"} or not host:
+            return ""
+        authority = f"[{host}]" if ":" in host else host
+        if parts.port is not None:
+            authority += f":{parts.port}"
+        return scrub_text(urlunsplit((parts.scheme, authority, parts.path, "", ""))).text
+    except ValueError:
+        return ""
+
+
 class BrowserDiagnosticsService:
     """Encapsulates diagnostics helpers and download persistence hooks."""
 
@@ -45,7 +63,7 @@ class BrowserDiagnosticsService:
         self.download_capture = download_capture
         # Page identity alone survives reloads; URLs also survive same-URL reloads.
         self._navigation_ids: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
-        self._request_scopes: weakref.WeakKeyDictionary[Any, tuple[Any, str]] = weakref.WeakKeyDictionary()
+        self._request_scopes: weakref.WeakKeyDictionary[Any, tuple[Any, str, dict[str, Any]]] = weakref.WeakKeyDictionary()
 
     async def get_console_messages(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
@@ -184,18 +202,17 @@ class BrowserDiagnosticsService:
     def _on_request(self, session: "BrowserSession", page: "Page", request: Any) -> None:
         navigation_id = self._navigation_ids.get(page)
         if navigation_id is not None:
-            self._request_scopes[request] = (weakref.ref(page), navigation_id)
+            entry = {
+                "method": str(getattr(request, "method", "GET") or "GET").upper(),
+                "url": _network_metadata_url(str(getattr(request, "url", "") or "")),
+                "resource_type": str(getattr(request, "resource_type", "other") or "other"),
+                "status": None,
+                "failed": False,
+            }
+            self._request_scopes[request] = (weakref.ref(page), navigation_id, entry)
             buf = self._scope_buffer(session, page, navigation_id)
             if buf is not None:
-                from ...pii_scrub import scrub_text
-
-                _tab_bounded_append(buf.network_requests, {
-                    "method": str(getattr(request, "method", "GET") or "GET").upper(),
-                    "url": scrub_text(str(getattr(request, "url", "") or "")).text,
-                    "resource_type": str(getattr(request, "resource_type", "other") or "other"),
-                    "status": None,
-                    "failed": False,
-                })
+                _tab_bounded_append(buf.network_requests, entry)
 
     def _request_navigation(self, page: "Page", request: Any) -> str | None:
         scope = self._request_scopes.get(request)
@@ -203,9 +220,9 @@ class BrowserDiagnosticsService:
 
     def _schedule_response(self, session: "BrowserSession", page: "Page", response: "Response") -> None:
         # Capture synchronously: requestfinished can precede the task's first run.
-        navigation_id = self._request_navigation(page, response.request)
-        if navigation_id is not None:
-            spawn_background_task(self._on_response(session, page, response, navigation_id))
+        scope = self._request_scopes.get(response.request)
+        if scope is not None and scope[0]() is page:
+            spawn_background_task(self._on_response(session, page, response, scope[1], scope[2]))
 
     def _on_console(self, session: "BrowserSession", page: "Page", message: Any) -> None:
         entry = {"type": message.type, "text": message.text, "location": message.location}
@@ -235,7 +252,8 @@ class BrowserDiagnosticsService:
             _tab_bounded_append(buf.request_failures, entry)
 
     async def _on_response(
-        self, session: "BrowserSession", page: "Page", response: "Response", navigation_id: str
+        self, session: "BrowserSession", page: "Page", response: "Response", navigation_id: str,
+        network_entry: dict[str, Any],
     ) -> None:
         """A failed XHR/fetch response (status >= 400): capture its JSON/text
         body, capped and PII-scrubbed -- this is where a site states the real
@@ -245,15 +263,8 @@ class BrowserDiagnosticsService:
                 return
             status = response.status
             buf = self._scope_buffer(session, page, navigation_id)
-            if buf is not None:
-                from ...pii_scrub import scrub_text
-
-                request = getattr(response, "request", None)
-                request_url = scrub_text(str(getattr(request, "url", "") or response.url)).text
-                for entry in reversed(buf.network_requests):
-                    if entry.get("url") == request_url and entry.get("status") is None:
-                        entry["status"] = status
-                        break
+            if buf is not None and any(entry is network_entry for entry in buf.network_requests):
+                network_entry["status"] = status
             if status < 400:
                 return
             request = getattr(response, "request", None)
