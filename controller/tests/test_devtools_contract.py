@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -115,12 +116,43 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
                     assert waited.status_code == 200
                     assert waited.json()["url"] == employee_page.url
 
+                    class SyntheticRequest:
+                        method = "GET"
+                        resource_type = "fetch"
+
+                        def __init__(self, url: str) -> None:
+                            self.url = url
+
+                    network_urls = [
+                        ("https://user:FixtureOnly@example.test/items?code=FixtureOnly#fragment",
+                         "https://example.test/items"),
+                        ("http://user:FixtureOnly@example.test:8080/items?code=FixtureOnly",
+                         "http://example.test:8080/items"),
+                        ("https://[2001:db8::1]/items#FixtureOnly", "https://[2001:db8::1]/items"),
+                        ("data:text/html,FixtureOnly", ""),
+                        ("file:///FixtureOnly", ""),
+                        ("https://example.test:invalid/FixtureOnly", ""),
+                        ("https://exa mple.test/FixtureOnly", ""),
+                        ("https://[invalid/FixtureOnly", ""),
+                    ]
+                    for url, _expected in network_urls:
+                        request = SyntheticRequest(url)
+                        manager.diagnostics._on_request(session, employee_page, request)
+                        await manager.diagnostics._on_response(
+                            session, employee_page,
+                            SimpleNamespace(request=request, url=url, status=204),
+                            manager.diagnostics._navigation_ids[employee_page],
+                        )
                     network = await client.get(
                         f"/sessions/{session.id}/network-log", headers=headers,
                     )
                     assert network.status_code == 200
                     assert network.json()["session"]["current_url"] == employee_page.url
                     assert "owner-only-value" not in str(network.json())
+                    entries = network.json()["entries"]
+                    assert [entry["url"] for entry in entries] == [expected for _url, expected in reversed(network_urls)]
+                    assert all(entry["status"] == 204 for entry in entries)
+                    assert "FixtureOnly" not in str(entries)
 
             finally:
                 await browser.close()

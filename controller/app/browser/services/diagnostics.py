@@ -8,11 +8,12 @@ import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from ...browser_scripts import VALIDATION_MESSAGES_SCRIPT
 from ...downloads import DownloadCaptureService
-from ...pii_scrub import PiiScrubber
+from ...pii_scrub import PiiScrubber, scrub_text
 from ...utils import UTC, spawn_background_task
 from ..tab_diagnostics import bounded_append as _tab_bounded_append
 from ..tab_diagnostics import get_buffer
@@ -34,6 +35,23 @@ _RESPONSE_BODY_SNIPPET_CHARS = 2000
 # third-party script 404 is noise an employee cannot act on; a failed document
 # navigation already shows up as its own console/page error.
 _DIAGNOSTIC_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
+
+
+def _network_metadata_url(value: str) -> str:
+    """Keep diagnostic host/path without credentials or URL-carried payloads."""
+    try:
+        if any(char.isspace() or ord(char) < 32 or char == "\\" for char in value):
+            return ""
+        parts = urlsplit(value)
+        host = parts.hostname
+        if parts.scheme not in {"http", "https"} or not host:
+            return ""
+        authority = f"[{host}]" if ":" in host else host
+        if parts.port is not None:
+            authority += f":{parts.port}"
+        return scrub_text(urlunsplit((parts.scheme, authority, parts.path, "", ""))).text
+    except ValueError:
+        return ""
 
 
 class BrowserDiagnosticsService:
@@ -187,11 +205,9 @@ class BrowserDiagnosticsService:
             self._request_scopes[request] = (weakref.ref(page), navigation_id)
             buf = self._scope_buffer(session, page, navigation_id)
             if buf is not None:
-                from ...pii_scrub import scrub_text
-
                 _tab_bounded_append(buf.network_requests, {
                     "method": str(getattr(request, "method", "GET") or "GET").upper(),
-                    "url": scrub_text(str(getattr(request, "url", "") or "")).text,
+                    "url": _network_metadata_url(str(getattr(request, "url", "") or "")),
                     "resource_type": str(getattr(request, "resource_type", "other") or "other"),
                     "status": None,
                     "failed": False,
@@ -246,10 +262,8 @@ class BrowserDiagnosticsService:
             status = response.status
             buf = self._scope_buffer(session, page, navigation_id)
             if buf is not None:
-                from ...pii_scrub import scrub_text
-
                 request = getattr(response, "request", None)
-                request_url = scrub_text(str(getattr(request, "url", "") or response.url)).text
+                request_url = _network_metadata_url(str(getattr(request, "url", "") or response.url))
                 for entry in reversed(buf.network_requests):
                     if entry.get("url") == request_url and entry.get("status") is None:
                         entry["status"] = status
