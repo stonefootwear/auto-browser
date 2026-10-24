@@ -64,6 +64,14 @@ from .witness import (
     WitnessSessionContext,
 )
 
+_TRUSTED_READ_PROJECTIONS = {
+    "document.readyState": "document.readyState",
+    "document.visibilityState": "document.visibilityState",
+    "window.innerWidth": "window.innerWidth",
+    "window.innerHeight": "window.innerHeight",
+}
+
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["BrowserManager", "BrowserSession", "PlaywrightError"]
@@ -607,6 +615,44 @@ class BrowserManager:
 
     async def observe(self, session_id: str, limit: int = 40, preset: str | None = None) -> dict[str, Any]:
         return await self.observation.observe(session_id, limit=limit, preset=preset)
+
+    async def snapshot(self, session_id: str) -> dict[str, Any]:
+        return await self.observation.snapshot(session_id)
+
+    async def evaluate_script(self, session_id: str, expression: str) -> Any:
+        """Return one fixed, non-content browser diagnostic projection.
+
+        The caller never supplies JavaScript to Chromium.  A short exact allowlist keeps the
+        standard tool name useful for built-in diagnostics without letting a worker encode,
+        slice, or transform secret-bearing DOM/storage/cookie values around a redactor.
+        """
+        trusted_expression = _TRUSTED_READ_PROJECTIONS.get(expression)
+        if trusted_expression is None:
+            raise ValueError("only trusted browser diagnostic projections are supported")
+        session = await self.get_session(session_id, read_only=True)
+        async with session.lock:
+            return await self.session_lifecycle.guarded(
+                session,
+                session.page.evaluate(trusted_expression),
+                what="evaluate_script",
+                timeout=self.settings.browser_call_timeout_seconds,
+            )
+
+    async def wait_for(self, session_id: str, *, text: str | None, uid: str | None,
+                       timeout_ms: int) -> dict[str, Any]:
+        session = await self.get_session(session_id, read_only=True)
+        async with session.lock:
+            if uid is not None:
+                target = session.page.locator(f'[data-operator-id="{uid}"]')
+            else:
+                target = session.page.get_by_text(text or "", exact=False).first
+            await self.session_lifecycle.guarded(
+                session,
+                target.wait_for(state="visible", timeout=timeout_ms),
+                what="wait_for",
+                timeout=max(self.settings.browser_call_timeout_seconds, timeout_ms / 1000 + 2),
+            )
+        return {"found": True, "text": text, "uid": uid, "url": session.page.url}
 
     async def capture_screenshot(self, session_id: str, *, label: str = "manual") -> dict[str, Any]:
         return await self.observation.capture_screenshot(session_id, label=label)

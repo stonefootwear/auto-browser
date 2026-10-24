@@ -180,6 +180,22 @@ class WaitRequest(StrictInputModel):
     wait_ms: int = Field(default=0, ge=0, le=30000, description="Milliseconds to wait (max 30s)")
 
 
+class WaitForRequest(StrictInputModel):
+    text: str | None = Field(default=None, min_length=1, max_length=500)
+    uid: str | None = Field(default=None, pattern=r"^op-[A-Za-z0-9]{4,40}$")
+    timeout_ms: int = Field(default=10000, ge=1, le=30000)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "WaitForRequest":
+        if bool(self.text) == bool(self.uid):
+            raise ValueError("wait_for requires exactly one of text or uid")
+        return self
+
+
+class EvaluateScriptRequest(StrictInputModel):
+    expression: str = Field(min_length=1, max_length=20000)
+
+
 class NavigateRequest(StrictInputModel):
     url: str = Field(min_length=1, max_length=2000)
 

@@ -17,6 +17,7 @@ from ..models import (
     DialogRequest,
     DomQueryRequest,
     DownloadFileRequest,
+    EvaluateScriptRequest,
     ExecuteActionRequest,
     HoverRequest,
     HumanTakeoverRequest,
@@ -32,6 +33,7 @@ from ..models import (
     TypeRequest,
     UploadRequest,
     WaitRequest,
+    WaitForRequest,
 )
 from ._utils import internal_error
 
@@ -90,6 +92,17 @@ def create_sessions_router(*, manager: Any) -> APIRouter:
             raise
         except Exception:
             raise internal_error(logger, "observe failed for session %s", session_id) from None
+
+    @router.get("/sessions/{session_id}/snapshot")
+    async def snapshot(session_id: str) -> dict[str, Any]:
+        try:
+            return await manager.snapshot(session_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Unknown session") from None
+        except BrowserActionError:
+            raise
+        except Exception:
+            raise internal_error(logger, "snapshot failed for session %s", session_id) from None
 
     @router.get("/sessions/{session_id}/diagnostics")
     async def get_diagnostics(session_id: str, limit: int = 20) -> dict[str, Any]:
@@ -274,6 +287,32 @@ def create_sessions_router(*, manager: Any) -> APIRouter:
             raise
         except Exception:
             raise internal_error(logger, "dialog failed for session %s", session_id) from None
+
+    @router.post("/sessions/{session_id}/actions/evaluate-script")
+    async def evaluate_script(session_id: str, payload: EvaluateScriptRequest) -> Any:
+        try:
+            return await manager.evaluate_script(session_id, payload.expression)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Unknown session") from None
+        except BrowserActionError:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except Exception:
+            raise internal_error(logger, "evaluate-script failed for session %s", session_id) from None
+
+    @router.post("/sessions/{session_id}/actions/wait-for")
+    async def wait_for(session_id: str, payload: WaitForRequest) -> dict[str, Any]:
+        try:
+            return await manager.wait_for(
+                session_id, text=payload.text, uid=payload.uid, timeout_ms=payload.timeout_ms
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Unknown session") from None
+        except BrowserActionError:
+            raise
+        except Exception:
+            raise internal_error(logger, "wait-for failed for session %s", session_id) from None
 
     @router.post("/sessions/{session_id}/actions/scroll")
     async def scroll(session_id: str, payload: ScrollRequest) -> dict[str, Any]:
