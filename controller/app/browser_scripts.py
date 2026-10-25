@@ -1003,12 +1003,15 @@ DOM_QUERY_SCRIPT = r"""
     : null;
   function isPainted(el) {
     const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
+    for (let node = el; node; node = node.parentElement) {
+      const style = window.getComputedStyle(node);
+      if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0'
+          || style.contentVisibility === 'hidden' || node.hidden
+          || node.getAttribute('aria-hidden') === 'true') return false;
+    }
     return rect.width > 0 && rect.height > 0
       && rect.right > 0 && rect.bottom > 0
-      && rect.left < window.innerWidth && rect.top < window.innerHeight
-      && style.visibility !== 'hidden' && style.display !== 'none'
-      && style.opacity !== '0' && !el.closest('[aria-hidden="true"]');
+      && rect.left < window.innerWidth && rect.top < window.innerHeight;
   }
   function isVisible(el) {
     if (!isPainted(el)) return false;
@@ -1045,17 +1048,37 @@ DOM_QUERY_SCRIPT = r"""
     const type = (el.getAttribute('type') || '').toLowerCase();
     return el.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(type) ? el.value : '';
   }
+  function editorContent(el) {
+    return ['INPUT', 'TEXTAREA'].includes(el.tagName) || el.isContentEditable
+      || Boolean(el.closest('[contenteditable]:not([contenteditable="false" i]), [role="textbox" i]'));
+  }
+  function summaryText(el) {
+    if (!isPainted(el)) return '';
+    if (editorContent(el)) return buttonValue(el);
+    // Walk rendered text, not textContent/innerText aggregation across editors.
+    // The existing query scan ceiling also bounds each parent summary traversal.
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const parts = [];
+    let node;
+    let scanned = 0;
+    while ((node = walker.nextNode()) && scanned++ < 2000) {
+      const parent = node.parentElement;
+      if (parent && !editorContent(parent) && isPainted(parent)) parts.push(node.textContent || '');
+    }
+    return parts.join(' ').replace(/\s+/g, ' ').trim();
+  }
   function accessibleName(el) {
     const labelledBy = (el.getAttribute('aria-labelledby') || '')
       .split(/\s+/)
       .filter(Boolean)
-      .map((id) => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || '')
+      .map((id) => document.getElementById(id))
+      .map((label) => label ? summaryText(label) : '')
       .join(' ');
     const associatedLabels = el.labels
-      ? [...el.labels].map((label) => label.innerText || label.textContent || '').join(' ')
+      ? [...el.labels].map(summaryText).join(' ')
       : '';
     const raw = el.getAttribute('aria-label') || labelledBy || associatedLabels
-      || el.getAttribute('placeholder') || el.innerText || buttonValue(el)
+      || el.getAttribute('placeholder') || summaryText(el) || buttonValue(el)
       || el.getAttribute('name') || el.id || el.href || '';
     return String(raw).replace(/\s+/g, ' ').trim().slice(0, 160);
   }
@@ -1123,12 +1146,9 @@ DOM_QUERY_SCRIPT = r"""
   const out = [];
   for (const el of nodes) {
     if (out.length >= limit) break;
-    // The opt-in editor read must not accidentally carry a password/OTP value
-    // through the legacy summary field beside the protected editor_text field.
-    const hideSensitiveEditorText = editorTextLimit !== null && sensitiveEditor(el);
-    const t = hideSensitiveEditorText
-      ? ''
-      : (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!isPainted(el)) continue;
+    // Editable contents are available only through the existing opt-in read.
+    const t = summaryText(el);
     if (needle && !t.toLowerCase().includes(needle)) continue;
     const rect = el.getBoundingClientRect();
     const visible = isVisible(el);
@@ -1161,6 +1181,21 @@ DOM_QUERY_SCRIPT = r"""
     };
     const editorText = trustedEditorText(el, visible);
     if (editorText !== null) item.editor_text = editorText;
+    if (['VIDEO', 'AUDIO'].includes(el.tagName)) {
+      const finite = (value) => Number.isFinite(value) ? value : null;
+      item.media = {
+        kind: el.tagName.toLowerCase(),
+        duration: finite(el.duration),
+        current_time: finite(el.currentTime),
+        paused: Boolean(el.paused),
+        ended: Boolean(el.ended),
+        ready_state: el.readyState,
+        video_width: el.tagName === 'VIDEO' ? el.videoWidth : null,
+        video_height: el.tagName === 'VIDEO' ? el.videoHeight : null,
+        loop: Boolean(el.loop),
+        controls: Boolean(el.controls),
+      };
+    }
     out.push(item);
   }
   return { error: null, items: out, total_matched };

@@ -21,6 +21,7 @@ launch here.
 from __future__ import annotations
 
 import http.server
+import json
 import tempfile
 import threading
 import unittest
@@ -360,9 +361,7 @@ class DiagnosticsDomQueryRealBrowserTests(unittest.IsolatedAsyncioTestCase):
 
         legacy = await self._dom_query(tab_id, css="#composer")
         self.assertNotIn("editor_text", legacy["items"][0])
-        # Legacy String.slice remains a 200 UTF-16-unit summary; the emoji uses
-        # two units, so Python sees 199 Unicode code points here.
-        self.assertGreaterEqual(len(legacy["items"][0]["text"]), 199)
+        self.assertEqual(legacy["items"][0]["text"], "")
 
         result = await self._dom_query(tab_id, css="#composer", editor_text_limit=4096)
         editor = result["items"][0]["editor_text"]
@@ -386,6 +385,49 @@ class DiagnosticsDomQueryRealBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(protected_item["editor_text"]["reason"], "sensitive_editor")
         self.assertIsNone(protected_item["editor_text"]["text"])
         self.assertNotIn(secret, str(protected_item))
+
+        await page.set_content('''<main id="public-parent">
+            <p>Visible public caption</p>
+            <input type="hidden" value="hidden-input-seed">
+            <input aria-label="Contact field" value="input-value-seed">
+            <input type="password" aria-label="Password" value="password-value-seed">
+            <textarea aria-label="Notes">textarea-content-seed</textarea>
+            <div contenteditable="true" role="textbox" aria-label="Composer">editable-content-seed</div>
+            <div role="textbox"><span>role-textbox-seed</span></div>
+            <div contenteditable="true"><span contenteditable="false">nested-editor-seed</span></div>
+            <div hidden><span>hidden-content-seed</span></div>
+            <div style="display:none"><span>display-none-seed</span></div>
+            <div style="opacity:0"><span>transparent-content-seed</span></div>
+            <div aria-hidden="true"><span id="hidden-label">aria-hidden-content-seed</span></div>
+            <button aria-labelledby="hidden-label">Visible button caption</button>
+            <input type="submit" value="Visible submit caption">
+            <video id="clip" controls loop preload="none" style="width:200px;height:60px"
+                   src="data:video/mp4,private-media-source-seed"></video>
+            <audio id="sound" controls preload="none" style="width:200px;height:60px"></audio>
+        </main>''')
+        private_seeds = [
+            "hidden-input-seed", "input-value-seed", "password-value-seed", "textarea-content-seed",
+            "editable-content-seed", "role-textbox-seed", "nested-editor-seed", "hidden-content-seed",
+            "display-none-seed", "transparent-content-seed", "aria-hidden-content-seed",
+            "private-media-source-seed",
+        ]
+        default = await self._dom_query(tab_id, css="*", limit=100)
+        parent = await self._dom_query(tab_id, css="#public-parent")
+        for result in (default, parent):
+            serialized = json.dumps(result)
+            self.assertTrue(all(seed not in serialized for seed in private_seeds))
+        self.assertIn("Visible public caption", parent["items"][0]["text"])
+        labels = {item["label"] for item in default["items"]}
+        self.assertIn("Visible button caption", labels)
+        self.assertIn("Visible submit caption", labels)
+        self.assertEqual((await self._dom_query(tab_id, text="role-textbox-seed"))["items"], [])
+        for media_id, kind in (("clip", "video"), ("sound", "audio")):
+            media = (await self._dom_query(tab_id, css=f"#{media_id}"))["items"][0]["media"]
+            self.assertEqual(media, {
+                "kind": kind, "duration": None, "current_time": 0, "paused": True, "ended": False,
+                "ready_state": 0, "video_width": 0 if kind == "video" else None,
+                "video_height": 0 if kind == "video" else None, "loop": kind == "video", "controls": True,
+            })
 
     async def test_a_failed_click_carries_the_same_digest_the_employee_would_get_from_diagnostics(self) -> None:
         tab_id, page = await self._employee_tab("/form")
