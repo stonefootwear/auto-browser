@@ -172,9 +172,9 @@ class BrowserObservationService:
             return {
                 "url": page.url,
                 "title": "",
+                "media": [],
                 "text": "",
                 "controls": [],
-                "media": [],
                 "open_dialog": open_dialog,
             }
         raw = await page.evaluate(INTERACTABLES_SCRIPT, 0)
@@ -185,9 +185,9 @@ class BrowserObservationService:
         return {
             "url": page.url,
             "title": await page.title(),
+            "media": media if isinstance(media, list) else [],
             "text": text if isinstance(text, str) else "",
             "controls": controls if isinstance(controls, list) else [],
-            "media": media if isinstance(media, list) else [],
             "active_dialog": active_dialog,
             "open_dialog": None,
         }
