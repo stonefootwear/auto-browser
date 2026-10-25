@@ -66,6 +66,19 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
                     Object.defineProperty(video, 'duration', {value: Infinity});
                     Object.defineProperty(video, 'currentTime', {value: 1.25});
                     document.body.append(video, document.createElement('audio'));
+                    const labelled = document.createElement('img');
+                    labelled.alt = 'Preview frame';
+                    labelled.width = 100;
+                    labelled.height = 80;
+                    const unnamed = document.createElement('img');
+                    unnamed.id = 'private-dom-id';
+                    unnamed.width = 100;
+                    unnamed.height = 80;
+                    unnamed.addEventListener('mouseenter', () => { unnamed.dataset.wasHovered = 'true'; });
+                    const hidden = document.createElement('img');
+                    hidden.alt = 'Hidden frame';
+                    hidden.style.display = 'none';
+                    document.body.append(labelled, unnamed, hidden);
                 }""")
                 artifact_dir = root / "artifacts" / "real-eval"
                 artifact_dir.mkdir(parents=True)
@@ -119,6 +132,21 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
                     ]
                     assert all("id" not in item for item in snapshot.json()["media"])
                     assert "media" not in str(snapshot.json()["controls"])
+                    images = [item for item in snapshot.json()["controls"] if item["tag"] == "img"]
+                    assert len(images) == 2
+                    assert [item["label"] for item in images] == ["Preview frame", ""]
+                    assert all(item["role"] == "img" and item["element_id"].startswith("op-") for item in images)
+                    assert "private-dom-id" not in str(images)
+                    again = await client.get(f"/sessions/{session.id}/snapshot", headers=headers)
+                    assert [item["element_id"] for item in again.json()["controls"] if item["tag"] == "img"] == [
+                        item["element_id"] for item in images
+                    ]
+                    hovered = await client.post(
+                        f"/sessions/{session.id}/actions/hover", headers=headers,
+                        json={"element_id": images[1]["element_id"], "pace": "fast"},
+                    )
+                    assert hovered.status_code == 200
+                    assert await employee_page.evaluate("document.getElementById('private-dom-id').dataset.wasHovered") == "true"
 
                     evaluated = await client.post(
                         f"/sessions/{session.id}/actions/evaluate-script",

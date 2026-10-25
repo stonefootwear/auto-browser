@@ -167,7 +167,9 @@ INTERACTABLES_SCRIPT = r"""
     const associatedLabels = el.labels
       ? [...el.labels].map((label) => label.innerText || label.textContent || '').join(' ')
       : '';
-    const raw = el.getAttribute('aria-label')
+    const raw = fullSnapshot && el.tagName === 'IMG'
+      ? (el.getAttribute('aria-label') || labelledBy || el.getAttribute('alt') || '')
+      : el.getAttribute('aria-label')
       || labelledBy
       || associatedLabels
       || el.getAttribute('placeholder')
@@ -228,7 +230,8 @@ INTERACTABLES_SCRIPT = r"""
     '[role="radio"]',
     '[role="switch"]',
     '[contenteditable="true"]',
-    '[tabindex]'
+    '[tabindex]',
+    ...(fullSnapshot ? ['img'] : [])
   ].join(',');
 
   const out = [];
