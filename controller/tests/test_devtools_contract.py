@@ -105,18 +105,19 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
                     assert "owner-only-value" not in str(snapshot.json())
                     assert snapshot.json()["media"] == [
                         {
-                            "kind": "video", "element_id": "op-media123", "id": "rendered-preview",
+                            "kind": "video", "element_id": "op-media123",
                             "paused": True, "ended": False, "current_time": 1.25,
                             "duration": None, "ready_state": 0, "video_width": 0,
                             "video_height": 0, "controls": True,
                         },
                         {
-                            "kind": "audio", "element_id": None, "id": None,
+                            "kind": "audio", "element_id": None,
                             "paused": True, "ended": False, "current_time": 0,
                             "duration": None, "ready_state": 0, "video_width": None,
                             "video_height": None, "controls": False,
                         },
                     ]
+                    assert all("id" not in item for item in snapshot.json()["media"])
                     assert "media" not in str(snapshot.json()["controls"])
 
                     evaluated = await client.post(

@@ -384,7 +384,6 @@ INTERACTABLES_SCRIPT = r"""
     return {
       kind: el.tagName.toLowerCase(),
       element_id: el.dataset.operatorId || null,
-      id: el.id ? el.id.slice(0, 160) : null,
       paused: Boolean(el.paused),
       ended: Boolean(el.ended),
       current_time: finite(el.currentTime),
