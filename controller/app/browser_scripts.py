@@ -377,7 +377,24 @@ INTERACTABLES_SCRIPT = r"""
       }
     };
   }
-  return {interactables: out, active_dialog: dialogSummary};
+  // Playback facts are read only and carry no source URLs or media contents.
+  // Keep this separate from controls: a media node is not a click target.
+  const media = fullSnapshot ? [...document.querySelectorAll('video, audio')].slice(0, 20).map((el) => {
+    const finite = (value) => Number.isFinite(value) ? value : null;
+    return {
+      kind: el.tagName.toLowerCase(),
+      element_id: el.dataset.operatorId || null,
+      paused: Boolean(el.paused),
+      ended: Boolean(el.ended),
+      current_time: finite(el.currentTime),
+      duration: finite(el.duration),
+      ready_state: el.readyState,
+      video_width: el.tagName === 'VIDEO' ? el.videoWidth : null,
+      video_height: el.tagName === 'VIDEO' ? el.videoHeight : null,
+      controls: Boolean(el.controls),
+    };
+  }) : [];
+  return {interactables: out, active_dialog: dialogSummary, media};
 }
 """
 

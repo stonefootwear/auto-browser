@@ -174,17 +174,20 @@ class BrowserObservationService:
                 "title": "",
                 "text": "",
                 "controls": [],
+                "media": [],
                 "open_dialog": open_dialog,
             }
         raw = await page.evaluate(INTERACTABLES_SCRIPT, 0)
         controls = raw.get("interactables") if isinstance(raw, dict) else raw
         active_dialog = raw.get("active_dialog") if isinstance(raw, dict) else None
+        media = raw.get("media") if isinstance(raw, dict) else None
         text = await page.evaluate("() => document.body ? document.body.innerText : ''")
         return {
             "url": page.url,
             "title": await page.title(),
             "text": text if isinstance(text, str) else "",
             "controls": controls if isinstance(controls, list) else [],
+            "media": media if isinstance(media, list) else [],
             "active_dialog": active_dialog,
             "open_dialog": None,
         }
