@@ -58,6 +58,15 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
                 await employee_page.goto(
                     "data:text/html,<title>Employee tab</title><p>employee-visible</p>"
                 )
+                await employee_page.evaluate("""() => {
+                    const video = document.createElement('video');
+                    video.id = 'rendered-preview';
+                    video.dataset.operatorId = 'op-media123';
+                    video.controls = true;
+                    Object.defineProperty(video, 'duration', {value: Infinity});
+                    Object.defineProperty(video, 'currentTime', {value: 1.25});
+                    document.body.append(video, document.createElement('audio'));
+                }""")
                 artifact_dir = root / "artifacts" / "real-eval"
                 artifact_dir.mkdir(parents=True)
                 session = BrowserSession(
@@ -94,6 +103,21 @@ async def test_real_chromium_devtools_reads_stay_in_the_employee_tab_and_eval_is
                     assert snapshot.json()["url"] == employee_page.url
                     assert "employee-visible" in snapshot.json()["text"]
                     assert "owner-only-value" not in str(snapshot.json())
+                    assert snapshot.json()["media"] == [
+                        {
+                            "kind": "video", "element_id": "op-media123", "id": "rendered-preview",
+                            "paused": True, "ended": False, "current_time": 1.25,
+                            "duration": None, "ready_state": 0, "video_width": 0,
+                            "video_height": 0, "controls": True,
+                        },
+                        {
+                            "kind": "audio", "element_id": None, "id": None,
+                            "paused": True, "ended": False, "current_time": 0,
+                            "duration": None, "ready_state": 0, "video_width": None,
+                            "video_height": None, "controls": False,
+                        },
+                    ]
+                    assert "media" not in str(snapshot.json()["controls"])
 
                     evaluated = await client.post(
                         f"/sessions/{session.id}/actions/evaluate-script",
