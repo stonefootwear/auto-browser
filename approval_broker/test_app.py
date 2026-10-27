@@ -1572,6 +1572,15 @@ def test_agent_can_ask_for_one_known_api_key_shape_only(tmp_path: Path, clock: l
                             json={"arguments": {"provider": "google", "tab_id": "t-0123456789ab"}})
         assert found.status_code == 200 and found.json()["keys"] == ["AIza" + "x" * 35]
         assert ("GET", "/sessions/owner-1/api-keys", {"provider": "google"}, "t-0123456789ab") in calls
-        for bad in ({}, {"provider": "openai"}, {"provider": "google", "selector": "body"}):
+        bosta = client.post(f"/requests/{request_id}/actions/find_api_keys", headers=auth(AGENT),
+                            json={"arguments": {"provider": "bosta", "tab_id": "t-0123456789ab"}})
+        assert bosta.status_code == 200
+        assert ("GET", "/sessions/owner-1/api-keys", {"provider": "bosta"}, "t-0123456789ab") in calls
+        prepared = client.post(f"/requests/{request_id}/actions/find_api_keys", headers=auth(AGENT),
+                               json={"arguments": {"provider": "bosta", "prepare_only": True, "tab_id": "t-0123456789ab"}})
+        assert prepared.status_code == 200
+        assert ("GET", "/sessions/owner-1/api-keys", {"provider": "bosta", "prepare_only": "true"}, "t-0123456789ab") in calls
+        for bad in ({}, {"provider": "openai"}, {"provider": "google", "selector": "body"},
+                    {"provider": "bosta", "prepare_only": "true"}, {"provider": "google", "prepare_only": True}):
             assert client.post(f"/requests/{request_id}/actions/find_api_keys", headers=auth(AGENT),
                                json={"arguments": bad}).status_code == 400

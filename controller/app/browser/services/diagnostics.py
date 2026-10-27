@@ -15,6 +15,7 @@ from ...browser_scripts import VALIDATION_MESSAGES_SCRIPT
 from ...downloads import DownloadCaptureService
 from ...pii_scrub import PiiScrubber, scrub_text
 from ...utils import UTC, spawn_background_task
+from ..secret_pages import private_session, protect_secret_page, secret_origin
 from ..tab_diagnostics import bounded_append as _tab_bounded_append
 from ..tab_diagnostics import get_buffer
 from ..tab_view import tab_id_for, unwrap_session
@@ -68,6 +69,8 @@ class BrowserDiagnosticsService:
     async def get_console_messages(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if await protect_secret_page(session):
+                return {"status": "sensitive_page", "items": [], "entries": [], "summary": {}, "enabled": False}
             messages = session.console_messages[-limit:]
             if self.pii_scrubber.console_enabled:
                 messages, hits = self.pii_scrubber.console(messages)
@@ -87,6 +90,8 @@ class BrowserDiagnosticsService:
     async def get_page_errors(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if await protect_secret_page(session):
+                return {"status": "sensitive_page", "items": [], "entries": [], "summary": {}, "enabled": False}
             return {
                 "session": await self.manager._session_summary(session),
                 "items": session.page_errors[-limit:],
@@ -95,6 +100,8 @@ class BrowserDiagnosticsService:
     async def get_request_failures(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if await protect_secret_page(session):
+                return {"status": "sensitive_page", "items": [], "entries": [], "summary": {}, "enabled": False}
             return {
                 "session": await self.manager._session_summary(session),
                 "items": session.request_failures[-limit:],
@@ -110,6 +117,8 @@ class BrowserDiagnosticsService:
     ) -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if await protect_secret_page(session):
+                return {"status": "sensitive_page", "items": [], "entries": [], "summary": {}, "enabled": False}
             if getattr(session, "tab_scoped", False) is True:
                 real = unwrap_session(session)
                 buf = get_buffer(real, session.tab_id)
@@ -186,7 +195,7 @@ class BrowserDiagnosticsService:
             self._scope_buffer(session, page, self._navigation_ids[page])
 
     def _scope_buffer(self, session: "BrowserSession", page: "Page", navigation_id: str | None) -> Any:
-        if navigation_id is None or self._navigation_ids.get(page) != navigation_id:
+        if secret_origin(getattr(page, "url", "")) or navigation_id is None or self._navigation_ids.get(page) != navigation_id:
             return None
         buf = get_buffer(session, tab_id_for(session, page))
         # A stable tab ID can be rebound to another Page (popup follow).
@@ -200,6 +209,8 @@ class BrowserDiagnosticsService:
         return buf
 
     def _on_request(self, session: "BrowserSession", page: "Page", request: Any) -> None:
+        if private_session(session) or secret_origin(getattr(page, "url", "")):
+            return
         navigation_id = self._navigation_ids.get(page)
         if navigation_id is not None:
             entry = {
@@ -219,12 +230,16 @@ class BrowserDiagnosticsService:
         return scope[1] if scope is not None and scope[0]() is page else None
 
     def _schedule_response(self, session: "BrowserSession", page: "Page", response: "Response") -> None:
+        if private_session(session) or secret_origin(getattr(page, "url", "")):
+            return
         # Capture synchronously: requestfinished can precede the task's first run.
         scope = self._request_scopes.get(response.request)
         if scope is not None and scope[0]() is page:
             spawn_background_task(self._on_response(session, page, response, scope[1], scope[2]))
 
     def _on_console(self, session: "BrowserSession", page: "Page", message: Any) -> None:
+        if private_session(session) or secret_origin(getattr(page, "url", "")):
+            return
         entry = {"type": message.type, "text": message.text, "location": message.location}
         self._bounded_append(session.console_messages, entry)
         buf = self._scope_buffer(session, page, self._navigation_ids.get(page))
@@ -232,6 +247,8 @@ class BrowserDiagnosticsService:
             _tab_bounded_append(buf.console, entry)
 
     def _on_pageerror(self, session: "BrowserSession", page: "Page", error: Any) -> None:
+        if private_session(session) or secret_origin(getattr(page, "url", "")):
+            return
         text = str(error)
         self._bounded_append(session.page_errors, text)
         buf = self._scope_buffer(session, page, self._navigation_ids.get(page))
@@ -239,6 +256,8 @@ class BrowserDiagnosticsService:
             _tab_bounded_append(buf.page_errors, {"text": text})
 
     def _on_request_failed(self, session: "BrowserSession", page: "Page", request: Any) -> None:
+        if private_session(session) or secret_origin(getattr(page, "url", "")):
+            return
         entry = {
             "url": request.url,
             "method": request.method,
@@ -258,6 +277,8 @@ class BrowserDiagnosticsService:
         """A failed XHR/fetch response (status >= 400): capture its JSON/text
         body, capped and PII-scrubbed -- this is where a site states the real
         reason ("invalid area"), which a bare status code never tells."""
+        if private_session(session) or secret_origin(getattr(page, "url", "")):
+            return
         try:
             if self._navigation_ids.get(page) != navigation_id:
                 return
@@ -310,6 +331,8 @@ class BrowserDiagnosticsService:
         visible validation messages, and the tab's own url/title."""
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if await protect_secret_page(session):
+                return {"status": "sensitive_page", "items": [], "entries": [], "summary": {}, "enabled": False}
             return await self.manager.session_lifecycle.guarded(
                 session, self._get_diagnostics_locked(session, limit=limit),
                 what="diagnostics", timeout=self.manager.settings.browser_call_timeout_seconds,
@@ -324,6 +347,8 @@ class BrowserDiagnosticsService:
         """The digest used both by GET /diagnostics (generous limit) and by
         the automatic error-payload attachment on a failed action (a small
         limit -- see app/actions/pipeline.py)."""
+        if await protect_secret_page(session):
+            return {"status": "sensitive_page", "console_errors": [], "page_errors": [], "failed_requests": [], "validation_messages": []}
         real = unwrap_session(session)
         page = session.page
         tab_id = getattr(session, "tab_id", None) or tab_id_for(real, page)
@@ -396,6 +421,9 @@ class BrowserDiagnosticsService:
         return list(record.downloads)
 
     async def handle_download(self, session: "BrowserSession", download: Any) -> None:
+        if private_session(session) or secret_origin(getattr(getattr(download, "page", None), "url", "")):
+            await download.cancel()
+            return
         record = await self.download_capture.capture(session, download)
         await self.manager.audit.append(
             event_type="download_captured",
@@ -417,6 +445,8 @@ class BrowserDiagnosticsService:
     async def screenshot_diff(self, session_id: str) -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if await protect_secret_page(session):
+                return {"status": "sensitive_page", "items": [], "entries": [], "summary": {}, "enabled": False}
             artifact_dir = session.artifact_dir
             prior_shots = sorted(
                 [path for path in artifact_dir.glob("*.png") if "diff-b" not in path.name],

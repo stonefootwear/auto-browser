@@ -32,8 +32,8 @@ from ..models import (
     TypeFocusedRequest,
     TypeRequest,
     UploadRequest,
-    WaitRequest,
     WaitForRequest,
+    WaitRequest,
 )
 from ._utils import internal_error
 
@@ -120,9 +120,9 @@ def create_sessions_router(*, manager: Any) -> APIRouter:
             raise internal_error(logger, "diagnostics failed for session %s", session_id) from None
 
     @router.get("/sessions/{session_id}/api-keys")
-    async def find_api_keys(session_id: str, provider: str) -> dict[str, Any]:
+    async def find_api_keys(session_id: str, provider: str, prepare_only: bool = False) -> dict[str, Any]:
         try:
-            return await manager.find_api_keys(session_id, provider)
+            return await manager.find_api_keys(session_id, provider, prepare_only=prepare_only)
         except KeyError:
             raise HTTPException(status_code=404, detail="Unknown session") from None
         except ValueError:

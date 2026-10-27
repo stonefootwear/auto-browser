@@ -17,6 +17,7 @@ from ...models import SessionRecord, SessionStatus
 from ...navigation_policy import await_public_dns_check
 from ...network_inspector import NetworkInspector
 from ...utils import UTC, spawn_background_task
+from ..secret_pages import BOSTA_URL, private_session, protect_secret_page
 from ..tab_scope import current_tab_id, detached_context
 from ..tab_view import (
     TabView,
@@ -539,6 +540,7 @@ class BrowserSessionService:
                 except Exception as exc:
                     logger.warning("session created hook failed for %s: %s", session_id, exc)
 
+            await protect_secret_page(session, destination=start_url or "")
             if start_url and not preserve_existing_page:
                 await page.goto(start_url, wait_until="domcontentloaded")
                 await self.manager._settle(page)
@@ -1759,6 +1761,8 @@ class BrowserSessionService:
     @staticmethod
     async def _page_snapshot(session: "BrowserSession") -> tuple[str, str, bool]:
         page = session.page
+        if private_session(session):
+            return BOSTA_URL, "Sensitive integration page", True
         is_closed = getattr(page, "is_closed", None)
         if callable(is_closed) and is_closed():
             return "", "", False

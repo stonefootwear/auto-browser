@@ -11,6 +11,7 @@ from playwright.async_api import Error as PlaywrightError
 
 from .. import events as _events
 from ..action_errors import BrowserActionError
+from ..browser.secret_pages import BOSTA_URL, private_session, protect_secret_page
 from ..utils import utc_now
 from ..witness import WitnessApproval
 
@@ -138,6 +139,7 @@ class BrowserActionPipeline:
                 session.agent_dialog_grace_until = time.monotonic() + float(grace)
 
     async def _run_marked(self, context: ActionRunContext) -> dict[str, Any]:
+        await protect_secret_page(context.session, destination=str(context.target.get("url") or ""))
         dialogs = _dialogs(context.manager)
         if dialogs is not None:
             # A dialog already up on this tab blocks every page call; fail fast
@@ -194,6 +196,11 @@ class BrowserActionPipeline:
                 url=context.session.page.url,
                 details=details,
             ) from exc
+        if private_session(context.session) or witness_state.before.get("privacy") == "protected":
+            pending_dialog = context.target.get("dialog")
+            context.target = {"mode": "sensitive_page"}
+            if pending_dialog is not None:
+                context.target["dialog"] = {"message": "[sensitive dialog]"}
         if context.target.get("dialog") is not None:
             return await self._record_pending_dialog(context, witness_state)
         return await self._record_success(context, witness_state)
@@ -263,6 +270,10 @@ class BrowserActionPipeline:
                 # stop here (every probe below would hang on it).
                 context.target["dialog"] = open_dialog
                 return
+        if await protect_secret_page(session):
+            manager._assert_runtime_url_allowed(session.page.url)
+            await _runtime_dns_check(manager, session.page.url)
+            return
         totp_result = None if context.action_name == "wait" else await manager._maybe_handle_totp(session)
         if totp_result is not None:
             context.target.setdefault("totp", totp_result)
@@ -372,6 +383,9 @@ class BrowserActionPipeline:
         witness_state: ActionWitnessState,
         exc: BrowserActionError,
     ) -> None:
+        if private_session(context.session) or witness_state.before.get("privacy") == "protected":
+            context.target = {"mode": "sensitive_page"}
+            exc.details.clear()
         failed = await context.manager._light_snapshot(context.session, label=f"failed-{context.action_name}")
         await self._record_terminal_event(
             context,
@@ -414,6 +428,9 @@ class BrowserActionPipeline:
     ) -> None:
         manager = context.manager
         session = context.session
+        if private_session(session) or witness_state.before.get("privacy") == "protected":
+            context.target = {"mode": "sensitive_page"}
+            error = "sensitive_page_action_failed"
         await manager._append_jsonl(
             session.artifact_dir / "actions.jsonl",
             {
@@ -502,7 +519,7 @@ class BrowserActionPipeline:
             ),
         )
         await manager._persist_session(session, status="active")
-        _events.emit_action(session.id, context.action_name, "ok", {"url": session.page.url})
+        _events.emit_action(session.id, context.action_name, "ok", {"url": BOSTA_URL if private_session(session) else session.page.url})
         return {
             "action": context.action_name,
             "action_class": action_class,
