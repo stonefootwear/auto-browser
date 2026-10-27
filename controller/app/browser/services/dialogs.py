@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...action_errors import BrowserActionError
 from ...utils import spawn_background_task, utc_now
+from ..secret_pages import BOSTA_URL, private_session, secret_origin
 
 if TYPE_CHECKING:
     from playwright.async_api import Dialog, Page
@@ -118,6 +119,8 @@ class BrowserDialogService:
             "opened_during": "agent_action" if agent_flow else "owner_or_site",
             "outcome": "open",
         }
+        if private_session(session) or secret_origin(getattr(page, "url", "")):
+            record.update(message="[sensitive dialog]", default_value="", url=BOSTA_URL)
         self._log(session, record)
         if decide(dialog_type, message, agent_flow=agent_flow) == "accept":
             try:

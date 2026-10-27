@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .browser.secret_pages import private_session, protect_secret_page
 from .utils import UTC
 
 
@@ -21,6 +22,8 @@ class SessionArtifactService:
         return artifact_dir
 
     async def capture_screenshot(self, session: Any, label: str) -> dict[str, str]:
+        if await protect_secret_page(session):
+            return {"path": None, "url": None}
         safe_label = self._safe_label(label)
         filename = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}Z-{safe_label}.png"
         path = session.artifact_dir / filename
@@ -29,6 +32,8 @@ class SessionArtifactService:
 
     @staticmethod
     def trace_payload(session: Any) -> dict[str, Any]:
+        if private_session(session) or getattr(session, "secret_page_mode", False) is True:
+            return {"trace_path": None, "trace_url": None, "trace_exists": False, "trace_recording": False}
         return {
             "trace_path": str(session.trace_path),
             "trace_url": f"/artifacts/{session.id}/{session.trace_path.name}",

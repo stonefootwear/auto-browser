@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...action_errors import BrowserActionError
 from ...navigation_policy import await_public_dns_check
+from ..secret_pages import BOSTA_URL, private_session, protect_secret_page, secret_origin
 from ..tab_view import (
     TabView,
     _is_closed,
@@ -94,6 +95,7 @@ class BrowserTabService:
         return new_page, tab_id
 
     async def _load(self, view: TabView, url: str) -> None:
+        await protect_secret_page(view, destination=url)
         await view.page.goto(url, wait_until="domcontentloaded")
         await self.manager._settle(view.page)
 
@@ -186,7 +188,7 @@ class BrowserTabService:
             try:
                 # One wedged background tab must not stall the whole list
                 # (and the session lock behind it).
-                title = await asyncio.wait_for(page.title(), 5)
+                title = "Sensitive integration page" if private_session(session) or secret_origin(page.url) else await asyncio.wait_for(page.title(), 5)
             except Exception:
                 title = ""
             tab_id = tab_id_for(session, page)
@@ -194,7 +196,7 @@ class BrowserTabService:
                 {
                     "index": index,
                     "active": page is session.page,
-                    "url": getattr(page, "url", ""),
+                    "url": BOSTA_URL if private_session(session) or secret_origin(page.url) else getattr(page, "url", ""),
                     "title": title,
                     "tab_id": tab_id,
                     "owner": tab_owner(session, tab_id),

@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from playwright.async_api import Page, Request, Response
 
     from .pii_scrub import PiiScrubber
+from .browser.secret_pages import secret_origin
 from .utils import UTC, spawn_background_task
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ class NetworkInspector:
         self._log: deque[dict[str, Any]] = deque(maxlen=max_entries)
         self._pending: dict[str, dict[str, Any]] = {}  # request_id → partial entry
         self._page: "Page | None" = None
+        self._secret_page = False
         self._lock = asyncio.Lock()
         self._hooks: dict[str, HookFn] = {}
 
@@ -105,6 +107,8 @@ class NetworkInspector:
         self, limit: int = 100, method: str | None = None, url_contains: str | None = None
     ) -> list[dict[str, Any]]:
         """Return captured network entries, most recent first."""
+        if self._secret_page or (self._page is not None and secret_origin(self._page.url)):
+            return []
         items = list(self._log)
         if method:
             items = [e for e in items if e.get("method", "").upper() == method.upper()]
@@ -181,6 +185,10 @@ class NetworkInspector:
     # ── Async handlers ─────────────────────────────────────────────────────
 
     async def _handle_request(self, request: "Request") -> None:
+        if secret_origin(getattr(request, "url", "")) or self._secret_page or (self._page is not None and secret_origin(self._page.url)):
+            self._secret_page = True
+            self.clear()
+            return
         try:
             resource_type = getattr(request, "resource_type", "other") or "other"
             if resource_type in _SKIP_RESOURCE_TYPES:
@@ -250,6 +258,10 @@ class NetworkInspector:
             logger.debug("network inspector request error: %s", exc)
 
     async def _handle_response(self, response: "Response") -> None:
+        if self._secret_page or (self._page is not None and secret_origin(self._page.url)):
+            self._secret_page = True
+            self.clear()
+            return
         try:
             request = response.request
             req_id = getattr(request, "_pii_entry_id", None)
@@ -295,6 +307,10 @@ class NetworkInspector:
             logger.debug("network inspector response error: %s", exc)
 
     async def _handle_request_failed(self, request: "Request") -> None:
+        if self._secret_page or (self._page is not None and secret_origin(self._page.url)):
+            self._secret_page = True
+            self.clear()
+            return
         try:
             req_id = getattr(request, "_pii_entry_id", None)
             if req_id is None:
@@ -316,6 +332,10 @@ class NetworkInspector:
             logger.debug("network inspector requestfailed error: %s", exc)
 
     async def _handle_request_finished(self, request: "Request") -> None:
+        if self._secret_page or (self._page is not None and secret_origin(self._page.url)):
+            self._secret_page = True
+            self.clear()
+            return
         try:
             req_id = getattr(request, "_pii_entry_id", None)
             if req_id is None:

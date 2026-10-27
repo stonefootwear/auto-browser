@@ -11,6 +11,14 @@ from urllib.parse import urlsplit
 from ... import events as _events
 from ...action_errors import BrowserActionError
 from ...browser_scripts import ACTIVE_ELEMENT_SCRIPT, DOM_QUERY_SCRIPT, INTERACTABLES_SCRIPT, PAGE_SUMMARY_SCRIPT
+from ..secret_pages import (
+    BOSTA_KEY_SCRIPT,
+    BOSTA_URL,
+    SAFE_CONTROLS_SCRIPT,
+    bosta_capture_url,
+    private_session,
+    protect_secret_page,
+)
 from ..tab_view import _is_closed, page_for_tab, unwrap_session
 
 if TYPE_CHECKING:
@@ -121,6 +129,26 @@ class BrowserObservationService:
     def __init__(self, manager: Any) -> None:
         self.manager = manager
 
+    async def _secret_payload(self, session: "BrowserSession") -> dict[str, Any]:
+        from .sessions import recorded_dialog
+
+        dialog = recorded_dialog(session)
+        safe_dialog = {"type": dialog.get("type"), "message": "[sensitive dialog]", "default_value": ""} if dialog else None
+        try:
+            controls = [] if dialog is not None else await asyncio.wait_for(
+                session.page.evaluate(SAFE_CONTROLS_SCRIPT), timeout=1.0,
+            )
+        except Exception:
+            controls = []
+        return {"session": await self.manager._session_summary(session),
+                "url": BOSTA_URL, "title": "Sensitive integration page", "privacy": "protected",
+                "text": "", "text_excerpt": "", "controls": controls, "interactables": controls,
+                "media": [], "active_element": None, "active_dialog": None,
+                "open_dialog": safe_dialog, "recent_dialogs": [], "dom_outline": {},
+                "accessibility_outline": {"available": False, "nodes": []}, "ocr": None,
+                "screenshot_path": None, "screenshot_url": None, "console_messages": [],
+                "page_errors": [], "request_failures": [], "tabs": [], "recent_downloads": []}
+
     async def observe(self, session_id: str, limit: int = 40, preset: str | None = None) -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
@@ -159,6 +187,8 @@ class BrowserObservationService:
     async def _snapshot_payload(self, session: "BrowserSession") -> dict[str, Any]:
         from .sessions import recorded_dialog
 
+        if await protect_secret_page(session):
+            return await self._secret_payload(session)
         real = unwrap_session(session)
         page = session.page
         if (_is_closed(page) or (getattr(session, "tab_scoped", False)
@@ -192,7 +222,7 @@ class BrowserObservationService:
             "open_dialog": None,
         }
 
-    async def find_api_keys(self, session_id: str, provider: str) -> dict[str, Any]:
+    async def find_api_keys(self, session_id: str, provider: str, *, prepare_only: bool = False) -> dict[str, Any]:
         """API keys of ONE known shape shown on the page -- or just copied by its "Copy" button.
 
         The narrowest read that lets the agent's server store a key the owner's employee just
@@ -204,11 +234,36 @@ class BrowserObservationService:
         key and the tab is on the provider's own site, reads the clipboard (a dialog that
         shows the key masked still copies the full key) -- matches only, cleared after.
         Through X-Tab-Id this is the employee's own tab, never the owner's active one."""
+        if provider == "bosta":
+            session = await self.manager.get_session(session_id, read_only=True)
+            async with session.lock:
+                if not bosta_capture_url(session.page.url):
+                    return {"provider": "bosta", "status": "source_refused", "keys": []}
+                await protect_secret_page(session)
+                if prepare_only:
+                    return {"provider": "bosta", "status": "ready", "keys": [], "url": BOSTA_URL, "privacy": "protected"}
+                try:
+                    result = await session.page.evaluate(BOSTA_KEY_SCRIPT)
+                except Exception:
+                    return {"provider": "bosta", "status": "capture_failed", "keys": []}
+                if not bosta_capture_url(session.page.url) or not isinstance(result, dict):
+                    return {"provider": "bosta", "status": "source_refused", "keys": []}
+                keys = result.get("keys")
+                valid = (result.get("status") == "found" and isinstance(keys, list) and len(keys) == 1
+                         and isinstance(keys[0], str) and 16 <= len(keys[0]) <= 4096
+                         and not re.search(r"[\s\x00-\x20\x7f*\u2022\u2026]", keys[0]) and "..." not in keys[0])
+                return {"provider": "bosta", "status": "found" if valid else "not_found",
+                        "keys": keys if valid else [], "url": BOSTA_URL,
+                        "source": "semantic_api_key_element", "privacy": "protected"}
+        if prepare_only:
+            raise ValueError("prepare_only requires bosta")
         pattern = API_KEY_PATTERNS.get(provider)
         if pattern is None:
             raise ValueError("unknown provider")
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if await protect_secret_page(session):
+                return {"provider": provider, "status": "source_refused", "keys": []}
             found, source = await self.manager.session_lifecycle.guarded(
                 session,
                 self._collect_api_keys(session.page, provider, pattern),
@@ -304,6 +359,8 @@ class BrowserObservationService:
         limit: int,
         editor_text_limit: int | None,
     ) -> dict[str, Any]:
+        if await protect_secret_page(session):
+            return {"status": "sensitive_page", "items": [], "total_matched": 0, "url": BOSTA_URL}
         try:
             raw = await session.page.evaluate(
                 DOM_QUERY_SCRIPT,
@@ -327,6 +384,8 @@ class BrowserObservationService:
     async def capture_screenshot(self, session_id: str, *, label: str = "manual") -> dict[str, Any]:
         session = await self.manager.get_session(session_id, read_only=True)
         async with session.lock:
+            if await protect_secret_page(session):
+                return await self._secret_payload(session)
             screenshot = await self.manager.session_lifecycle.guarded(
                 session,
                 self._capture_screenshot_redacted(session, label),
@@ -375,6 +434,9 @@ class BrowserObservationService:
     ) -> dict[str, Any]:
         from .dialogs import BrowserDialogService
         from .sessions import recorded_dialog
+
+        if await protect_secret_page(session):
+            return await self._secret_payload(session)
 
         if read_only:
             real = unwrap_session(session)
@@ -434,6 +496,8 @@ class BrowserObservationService:
         screenshot_label: str = "observe",
         preset: str | None = None,
     ) -> dict[str, Any]:
+        if await protect_secret_page(session):
+            return await self._secret_payload(session)
         if preset is None:
             preset = self.manager.settings.perception_preset_default
         if preset not in ("text", "fast", "normal", "rich"):
@@ -584,6 +648,8 @@ class BrowserObservationService:
         return screenshot
 
     async def light_snapshot(self, session: "BrowserSession", *, label: str) -> dict[str, Any]:
+        if await protect_secret_page(session):
+            return await self._secret_payload(session)
         screenshot = await self._capture_screenshot_redacted(session, label)
         summary = await self.page_summary(session.page)
         return {
@@ -599,12 +665,17 @@ class BrowserObservationService:
         }
 
     async def capture_session_screenshot(self, session: "BrowserSession", label: str) -> dict[str, str]:
+        if await protect_secret_page(session):
+            return {"path": None, "url": None}
         return await self.manager.artifacts.capture_screenshot(session, label)
 
     def trace_payload(self, session: "BrowserSession") -> dict[str, Any]:
         return self.manager.artifacts.trace_payload(session)
 
     async def stop_trace_recording(self, session: "BrowserSession") -> None:
+        if private_session(session) or getattr(session, "secret_page_mode", False) is True:
+            await protect_secret_page(session)
+            return
         if not self.manager.settings.enable_tracing or not session.trace_recording:
             session.trace_recording = False
             return

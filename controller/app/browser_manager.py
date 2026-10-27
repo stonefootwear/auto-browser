@@ -657,8 +657,8 @@ class BrowserManager:
     async def capture_screenshot(self, session_id: str, *, label: str = "manual") -> dict[str, Any]:
         return await self.observation.capture_screenshot(session_id, label=label)
 
-    async def find_api_keys(self, session_id: str, provider: str) -> dict[str, Any]:
-        return await self.observation.find_api_keys(session_id, provider)
+    async def find_api_keys(self, session_id: str, provider: str, *, prepare_only: bool = False) -> dict[str, Any]:
+        return await self.observation.find_api_keys(session_id, provider, prepare_only=prepare_only)
 
     async def stop_trace(self, session_id: str) -> dict[str, Any]:
         return await self.observation.stop_trace(session_id)

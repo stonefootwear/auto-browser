@@ -18,6 +18,7 @@ from ...text_normalize import normalize_arabic_text
 from ...utils import spawn_background_task
 from ...webhooks import dispatch_approval_event
 from ...witness import WitnessApproval
+from ..secret_pages import BOSTA_URL, protect_secret_page
 
 try:  # pragma: no cover - optional until dependency is installed in runtime image
     import pyotp
@@ -158,6 +159,8 @@ class BrowserActionService:
         async def operation() -> None:
             await session.page.goto(url, wait_until="domcontentloaded")
             await self.manager._settle(session.page)
+            if await protect_secret_page(session):
+                return
             challenge = await self.manager._check_bot_challenge(session)
             if challenge:
                 logger.warning("bot challenge detected after navigation: %s", challenge)
@@ -593,6 +596,8 @@ class BrowserActionService:
         )
 
     async def _approval_observation(self, session: "BrowserSession") -> dict[str, Any]:
+        if await protect_secret_page(session):
+            return {"url": BOSTA_URL, "title": "Sensitive integration page", "privacy": "protected"}
         return {
             "url": session.page.url,
             "title": await session.page.title(),

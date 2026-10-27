@@ -1205,9 +1205,11 @@ def create_app(
         if operation == "find_api_keys":
             headers = _pop_tab_id(arguments)
             provider = arguments.get("provider")
-            if set(arguments) != {"provider"} or provider not in {"google"}:
-                raise HTTPException(400, "find_api_keys requires provider 'google'")
-            return "GET", f"/sessions/{session_id}/api-keys?provider={provider}", None, headers
+            if (set(arguments) - {"provider", "prepare_only"} or provider not in {"google", "bosta"}
+                    or ("prepare_only" in arguments and (provider != "bosta" or type(arguments["prepare_only"]) is not bool))):
+                raise HTTPException(400, "find_api_keys requires a supported provider")
+            suffix = "&prepare_only=true" if arguments.get("prepare_only") is True else ""
+            return "GET", f"/sessions/{session_id}/api-keys?provider={provider}{suffix}", None, headers
         if operation == "list_tabs":
             if arguments:
                 raise HTTPException(400, "list_tabs takes no arguments")
