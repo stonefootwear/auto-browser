@@ -33,6 +33,15 @@ def bosta_capture_url(url: str) -> bool:
         return False
 
 
+def bosta_packaging_url(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        return (parts.scheme == "https" and parts.netloc == "business.bosta.co"
+                and parts.path == "/shop/packaging" and not parts.query and not parts.fragment)
+    except (ValueError, TypeError):
+        return False
+
+
 def private_session(session: Any) -> bool:
     return secret_origin(getattr(session.page, "url", ""))
 
@@ -202,6 +211,131 @@ SAFE_CONTROLS_SCRIPT = r"""() => {
 
 # A permission choice is public metadata, unlike credential input values. This
 # inspects only the provider's observed creation-form control and emits an enum.
+BOSTA_PACKAGING_SCRIPT = r"""() => {
+  if (location.href !== 'https://business.bosta.co/shop/packaging') return null;
+  const visible = el => !!el && el.getClientRects().length > 0
+    && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[aria-hidden="true"]');
+  const text = el => (el?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  const read = (root, selector) => {
+    const nodes = [...root.querySelectorAll(selector)].filter(visible);
+    return nodes.length === 1 ? text(nodes[0]) : '';
+  };
+  const drawers = [...document.querySelectorAll('.ant-drawer')].filter(drawer => {
+    const body = drawer.querySelector('.ant-drawer-body');
+    if (!visible(body)) return false;
+    const rect = body.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.bottom > 0
+      && rect.left < innerWidth && rect.top < innerHeight;
+  });
+  if (drawers.length > 1 || (drawers.length === 1 && read(drawers[0], '.ant-drawer-title') !== 'عربة التسوق')) return null;
+  const drawer = drawers[0] || null;
+  const modals = [...document.querySelectorAll('[role="dialog"],dialog[open],[aria-modal="true"]')].filter(visible);
+  if (modals.some(modal => !drawer || !drawer.contains(modal))) return null;
+  if ([...document.querySelectorAll('input[type="password"],input[autocomplete="one-time-code"],input[name*="otp" i],input[id*="otp" i],input[aria-label*="api key" i]')].some(visible)) return null;
+  const controls = [];
+  const control = (el, label, role = 'button', disabled = false) => {
+    if (!visible(el) || el.closest('.br-flyers-shop__checkout-button')) return null;
+    if (!/^op-[A-Za-z0-9]{4,40}$/.test(el.dataset.operatorId || ''))
+      el.dataset.operatorId = 'op-' + Math.random().toString(36).slice(2, 12);
+    let href = '';
+    if (el.tagName === 'A') {
+      let destination;
+      try { destination = new URL(el.getAttribute('href') || '', location.href); } catch (_) { return null; }
+      if (destination.origin !== 'https://business.bosta.co' || destination.search || destination.hash
+          || !/^\/(?:[a-z][a-z-]*\/?)*$/.test(destination.pathname)) return null;
+      href = destination.href;
+    }
+    controls.push({element_id:el.dataset.operatorId, uid:el.dataset.operatorId,
+      selector_hint:'[data-operator-id="' + el.dataset.operatorId + '"]', tag:el.tagName.toLowerCase(),
+      label, role:el.tagName === 'A' ? 'link' : role, type:'button', href, visible:true,
+      disabled:disabled || el.disabled === true || el.getAttribute('aria-disabled') === 'true'});
+    return el.dataset.operatorId;
+  };
+  const catalog = [];
+  for (const card of document.querySelectorAll('div.br-item-card__item-container')) {
+    const contents = [...card.querySelectorAll(':scope > div.br-item-card__item-content')].filter(visible);
+    if (contents.length !== 1) continue;
+    const content = contents[0];
+    const name = read(content, '.br-item-card__item-info > .br-item-card__item-details > .br-item-card__item-details-title > .br-item-card__item-details-title-section > span');
+    const price = read(content, '.br-item-card__item-pricing > span.body-medium');
+    if (!name || !price) continue;
+    const item = {name, price_text:price, size:read(content,'.br-item-card__item-size'),
+      limit:read(content,'.br-item-card__item-limit.caption'),
+      pack_unit:read(content,'.br-item-card__item-pricing > span.br-item-card__item-action-info-pack.caption')};
+    if (!drawer) {
+      if (content.classList.contains('br-item-card__item-content-clickable'))
+        item.uid = control(content, 'عرض مواد التغليف: ' + name + ' — ' + price);
+      const adds = [...card.querySelectorAll(':scope > div.br-item-card__item-action > div.br-item-card__icon-changer > button.br-list-item__action')].filter(visible);
+      if (adds.length === 1) item.add_uid = control(adds[0], 'إضافة إلى السلة: ' + name + ' — ' + price);
+    }
+    catalog.push(item);
+  }
+  const tabs = new Set(['المتجر','تتبع الطلبات','الكل','فلايرات','صناديق','ملصقات','أخرى']);
+  let cartSummary = '';
+  if (!drawer) for (const el of document.querySelectorAll('button,a,[role="button"],[role="tab"]')) {
+    if (!visible(el)) continue;
+    const label = text(el);
+    if (tabs.has(label)) control(el,label,el.getAttribute('role') === 'tab' ? 'tab' : 'button');
+    else if (/^عرض العربة\s*\([0-9٠-٩]+\)\s*[0-9٠-٩.,]+\s*ج\.?\s*م\.?$/.test(label)) {
+      cartSummary = label;
+      control(el,label);
+    }
+  }
+  let cart = {state:'closed', visible_summary:cartSummary || null, shipping_text:null, final_total_text:null};
+  if (drawer) {
+    const closes = [...drawer.querySelectorAll('.ant-drawer-header > .ant-drawer-extra span.anticon.anticon-close[role="img"][aria-label="close"]')].filter(visible);
+    if (closes.length === 1) control(closes[0],'إغلاق السلة');
+    const items = [];
+    for (const row of drawer.querySelectorAll('.ant-drawer-body .br-basket-item__container')) {
+      if (!visible(row)) continue;
+      const descriptions = [...row.querySelectorAll('.br-basket-item__description-section')].filter(visible);
+      if (descriptions.length !== 1) continue;
+      const nameLeaf = [descriptions[0], ...descriptions[0].querySelectorAll('span,p,div,h1,h2,h3,h4,h5,h6')]
+        .find(el => visible(el) && el.childElementCount === 0 && text(el));
+      const name = text(nameLeaf);
+      const price = read(row,'.br-basket-item__action-price');
+      if (!name || !price) continue;
+      const item = {name, price_text:price, size:read(row,'.br-basket-item__size'), limit:read(row,'.br-basket-item__limit')};
+      const controllers = [...row.querySelectorAll('.br-basket-item__action-controller')].filter(visible);
+      if (controllers.length === 1) {
+        const buttons = [...controllers[0].querySelectorAll('button')].filter(visible);
+        const inputs = [...controllers[0].querySelectorAll('input.ant-input-number-input')].filter(visible);
+        if (buttons.length === 2 && inputs.length === 1 && /^[0-9]{1,6}$/.test(inputs[0].value || '')) {
+          item.quantity = Number(inputs[0].value);
+          item.minus_uid = control(buttons[0],'تقليل الكمية: ' + name,'button',buttons[0].classList.contains('button-disabled'));
+          item.plus_uid = control(buttons[1],'زيادة الكمية: ' + name,'button',buttons[1].classList.contains('button-disabled'));
+          // Quantity is read as bounded numeric metadata. Keyboard editing is
+          // not offered until the checkout/form-submit relationship is proven.
+        }
+      }
+      const removes = [...row.querySelectorAll('.br-basket-item__action-delete')].filter(visible);
+      if (removes.length === 1) item.remove_uid = control(removes[0],'حذف من السلة: ' + name);
+      items.push(item);
+    }
+    const costs = [...drawer.querySelectorAll('.br-flyers-shop__cart-checkout__amount-cost')].filter(visible);
+    let shipping = null;
+    if (costs.length === 1) {
+      const clone = costs[0].cloneNode(true);
+      clone.querySelectorAll('.br-flyers-shop__cart-checkout__amount-cost-currency').forEach(el => el.remove());
+      shipping = text(clone) || null;
+    }
+    cart = {state:'open', items, subtotal_text:read(drawer,'.br-flyers-shop__cart-checkout__amount-cost-currency') || null,
+      shipping_text:shipping, final_total_text:read(drawer,'.br-flyers-shop__total_price-checkout-title') || null};
+  }
+  if (!catalog.length && !drawer) return null;
+  const focused = document.activeElement;
+  let active_element = null;
+  if (focused?.closest('.br-flyers-shop__checkout-button')) {
+    // No checkout UID is offered. This fixed semantic lets the existing
+    // payment guard refuse keyboard activation of a focused purchase button.
+    active_element = {role:'button',type:'button',label:'Pay now'};
+  } else {
+    const known = controls.find(item => item.element_id === focused?.dataset?.operatorId);
+    if (known) active_element = {...known};
+  }
+  return {controls, catalog, cart, active_element, text:JSON.stringify({catalog,cart})};
+}"""
+
 BOSTA_CREATION_SCOPE_SCRIPT = r"""() => {
   const dialogs = [...document.querySelectorAll('[role="dialog"],dialog[open],[aria-modal="true"]')]
     .filter(el => el.getClientRects().length);

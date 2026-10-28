@@ -14,9 +14,11 @@ from ...browser_scripts import ACTIVE_ELEMENT_SCRIPT, DOM_QUERY_SCRIPT, INTERACT
 from ..secret_pages import (
     BOSTA_CREATION_SCOPE_SCRIPT,
     BOSTA_KEY_SCRIPT,
+    BOSTA_PACKAGING_SCRIPT,
     BOSTA_URL,
     SAFE_CONTROLS_SCRIPT,
     bosta_capture_url,
+    bosta_packaging_url,
     private_session,
     protect_secret_page,
     safe_bosta_url,
@@ -142,6 +144,15 @@ class BrowserObservationService:
             )
         except Exception:
             controls = []
+        packaging = None
+        if dialog is None and bosta_packaging_url(session.page.url):
+            try:
+                projected = await asyncio.wait_for(session.page.evaluate(BOSTA_PACKAGING_SCRIPT), timeout=1.0)
+                if isinstance(projected, dict) and isinstance(projected.get("controls"), list):
+                    packaging = projected
+                    controls = projected["controls"]
+            except Exception:
+                pass
         creation = None
         if bosta_capture_url(session.page.url):
             try:
@@ -150,8 +161,10 @@ class BrowserObservationService:
                 creation = {"state": "unverified", "scope": None, "confirm_uids": []}
         return {"session": await self.manager._session_summary(session),
                 "url": safe_bosta_url(session.page.url), "title": "Protected Bosta page", "privacy": "protected",
-                "text": "", "text_excerpt": "", "controls": controls, "interactables": controls,
-                "media": [], "active_element": None, "active_dialog": None,
+                "text": packaging["text"] if packaging else "", "text_excerpt": packaging["text"] if packaging else "",
+                "bosta_packaging": {"catalog": packaging["catalog"], "cart": packaging["cart"]} if packaging else None,
+                "controls": controls, "interactables": controls,
+                "media": [], "active_element": packaging["active_element"] if packaging else None, "active_dialog": None,
                 "bosta_key_creation": creation,
                 "open_dialog": safe_dialog, "recent_dialogs": [], "dom_outline": {},
                 "accessibility_outline": {"available": False, "nodes": []}, "ocr": None,
