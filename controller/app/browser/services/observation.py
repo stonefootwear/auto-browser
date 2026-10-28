@@ -12,12 +12,14 @@ from ... import events as _events
 from ...action_errors import BrowserActionError
 from ...browser_scripts import ACTIVE_ELEMENT_SCRIPT, DOM_QUERY_SCRIPT, INTERACTABLES_SCRIPT, PAGE_SUMMARY_SCRIPT
 from ..secret_pages import (
+    BOSTA_CREATION_SCOPE_SCRIPT,
     BOSTA_KEY_SCRIPT,
     BOSTA_URL,
     SAFE_CONTROLS_SCRIPT,
     bosta_capture_url,
     private_session,
     protect_secret_page,
+    safe_bosta_url,
 )
 from ..tab_view import _is_closed, page_for_tab, unwrap_session
 
@@ -140,10 +142,17 @@ class BrowserObservationService:
             )
         except Exception:
             controls = []
+        creation = None
+        if bosta_capture_url(session.page.url):
+            try:
+                creation = await session.page.evaluate(BOSTA_CREATION_SCOPE_SCRIPT)
+            except Exception:
+                creation = {"state": "unverified", "scope": None, "confirm_uids": []}
         return {"session": await self.manager._session_summary(session),
-                "url": BOSTA_URL, "title": "Sensitive integration page", "privacy": "protected",
+                "url": safe_bosta_url(session.page.url), "title": "Protected Bosta page", "privacy": "protected",
                 "text": "", "text_excerpt": "", "controls": controls, "interactables": controls,
                 "media": [], "active_element": None, "active_dialog": None,
+                "bosta_key_creation": creation,
                 "open_dialog": safe_dialog, "recent_dialogs": [], "dom_outline": {},
                 "accessibility_outline": {"available": False, "nodes": []}, "ocr": None,
                 "screenshot_path": None, "screenshot_url": None, "console_messages": [],
@@ -241,6 +250,12 @@ class BrowserObservationService:
                     return {"provider": "bosta", "status": "source_refused", "keys": []}
                 await protect_secret_page(session)
                 if prepare_only:
+                    creation = await session.page.evaluate(BOSTA_CREATION_SCOPE_SCRIPT)
+                    if not (isinstance(creation, dict) and (
+                            creation.get("state") in {"not_present", "key_result"} or (
+                                creation.get("state") == "creation_form" and creation.get("scope") == "read_write"))):
+                        return {"provider": "bosta", "status": "scope_required", "keys": [],
+                                "url": BOSTA_URL, "privacy": "protected"}
                     return {"provider": "bosta", "status": "ready", "keys": [], "url": BOSTA_URL, "privacy": "protected"}
                 try:
                     result = await session.page.evaluate(BOSTA_KEY_SCRIPT)
@@ -254,7 +269,7 @@ class BrowserObservationService:
                          and not re.search(r"[\s\x00-\x20\x7f*\u2022\u2026]", keys[0]) and "..." not in keys[0])
                 return {"provider": "bosta", "status": "found" if valid else "not_found",
                         "keys": keys if valid else [], "url": BOSTA_URL,
-                        "source": "semantic_api_key_element", "privacy": "protected"}
+                        "source": result.get("source", "semantic_api_key_element"), "privacy": "protected"}
         if prepare_only:
             raise ValueError("prepare_only requires bosta")
         pattern = API_KEY_PATTERNS.get(provider)

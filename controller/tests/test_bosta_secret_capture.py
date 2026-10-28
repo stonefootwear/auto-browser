@@ -208,3 +208,88 @@ async def test_other_sites_keep_normal_navigation_while_context_trace_stays_disc
     assert snapshot["text"] == "ordinary site text"
     assert "privacy" not in snapshot
     assert not session.trace_recording and not session.trace_path.exists()
+
+
+async def test_signup_address_fields_and_choices_keep_actual_url_without_values(surface):
+    session, service = surface
+    for path in ("/signup", "/settings/addresses"):
+        await session.page.goto("https://business.bosta.co" + path)
+        await session.page.set_content(
+            f'<label for="name">Full name</label><input id="name" value="{KEY}">'
+            f'<label for="password">Password</label><input id="password" type="password" value="{KEY}">'
+            f'<label for="otp">Verification code</label><input id="otp" value="{KEY}">'
+            '<label for="address">Address</label><input id="address">'
+            '<label for="city">City</label><select id="city"><option>Cairo</option><option>Giza</option></select>'
+            f'<input aria-label="API key" value="{KEY}"><p>{KEY}</p><button>Save address</button>'
+        )
+        snapshot = await service._snapshot_payload(session)
+        assert snapshot["url"] == "https://business.bosta.co" + path
+        controls = {item["label"]: item for item in snapshot["controls"]}
+        assert {"full name", "password", "verification code", "address", "city", "save address"} <= controls.keys()
+        assert controls["password"]["type"] == "password"
+        assert controls["city"]["options"] == ["Cairo", "Giza"]
+        assert all(re.fullmatch(r"op-[A-Za-z0-9]{4,40}", row["element_id"]) for row in controls.values())
+        assert KEY not in json.dumps(snapshot)
+        assert not session.trace_recording and not session.trace_path.exists()
+
+
+async def test_actual_key_form_metadata_and_arabic_readwrite_choice_are_visible(surface):
+    session, service = surface
+    await session.page.set_content(
+        '<label for="createEditKeyForm_name">اسم المفتاح</label><input id="createEditKeyForm_name">'
+        '<label for="createEditKeyForm_apiGroupName">الصلاحية</label>'
+        '<input id="createEditKeyForm_apiGroupName" role="combobox" type="search">'
+        '<div role="option">قراءة و كتابة</div><div role="option">Full</div>'
+        '<button>إنشاء</button><button>طلب رمز التحقق</button>'
+    )
+    snapshot = await service._snapshot_payload(session)
+    labels = {item["label"] for item in snapshot["controls"]}
+    assert {"key name", "permission", "قراءة و كتابة", "إنشاء", "طلب رمز التحقق"} <= labels
+    assert "full" not in labels
+
+
+async def test_creation_preflight_refuses_full_scope_without_reading_key(surface):
+    session, service = surface
+    for choice, expected in (("Full", "scope_required"), ("قراءة و كتابة", "ready")):
+        await session.page.set_content('<div role="dialog"><input id="createEditKeyForm_name"><div class="ant-select">'
+            f'<span class="ant-select-selection-item">{choice}</span>'
+            '<input id="createEditKeyForm_apiGroupName" role="combobox" type="search"></div><button>إنشاء</button></div>'
+            f'<input aria-label="API key" value="{KEY}">')
+        snapshot = await service._snapshot_payload(session)
+        assert snapshot["bosta_key_creation"]["scope"] == ("full" if choice == "Full" else "read_write")
+        assert len(snapshot["bosta_key_creation"]["confirm_uids"]) == 1
+        result = await service.find_api_keys("s", "bosta", prepare_only=True)
+        assert result["status"] == expected and result["keys"] == []
+        assert KEY not in json.dumps(result)
+
+
+@pytest.mark.parametrize("invalid", [False, True], ids=["observed-dialog", "extra-field"])
+async def test_one_time_dialog_capture_has_exact_structural_provenance(surface, invalid):
+    session, service = surface
+    await session.page.set_content(
+        '<div role="dialog"><button class="ant-modal-close"></button>'
+        f'<input type="text" value="{KEY}"><button>نسخ</button><button>تم</button>'
+        + ('<input type="text">' if invalid else '') + '</div>'
+    )
+    prepared = await service.find_api_keys("s", "bosta", prepare_only=True)
+    assert prepared["status"] == ("scope_required" if invalid else "ready") and prepared["keys"] == []
+    result = await service.find_api_keys("s", "bosta")
+    if invalid:
+        assert result["keys"] == []
+    else:
+        assert result["keys"] == [KEY] and result["source"] == "bosta_one_time_key_dialog"
+    assert KEY not in json.dumps(await service._snapshot_payload(session))
+
+
+async def test_unknown_visible_api_modal_is_unverified_without_secret_payload(surface):
+    session, service = surface
+    await session.page.set_content(
+        '<input id="createEditKeyForm_apiGroupName" type="hidden">'
+        f'<div role="dialog"><label for="otp">Verification code</label><input id="otp" value="{KEY}">'
+        f'<p>{KEY}</p><button>Verify</button></div>'
+    )
+    snapshot = await service._snapshot_payload(session)
+    assert snapshot["bosta_key_creation"] == {"state": "unverified", "scope": None, "confirm_uids": []}
+    prepared = await service.find_api_keys("s", "bosta", prepare_only=True)
+    assert prepared["status"] == "scope_required" and prepared["keys"] == []
+    assert KEY not in json.dumps(snapshot) + json.dumps(prepared)
