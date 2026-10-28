@@ -364,3 +364,117 @@ async def test_observed_region_dialog_projects_component_choices_and_disabled_di
         await session.page.set_content(html)
         labels = {item["label"] for item in (await service._snapshot_payload(session))["controls"]}
         assert "القاهرة" not in labels and "مدينة نصر" not in labels and "منطقة بعيدة" not in labels
+
+
+def _packaging_catalog():
+    return (
+        f'<p>{KEY}</p><input type="hidden" value="{KEY}">'
+        '<button role="tab">المتجر</button><button role="tab">صناديق</button>'
+        '<button>عرض العربة (0) 0 ج.م</button>'
+        '<div class="br-item-card__item-container">'
+        '<div class="br-item-card__item-content br-item-card__item-content-clickable">'
+        '<div class="br-item-card__item-info"><div class="br-item-card__item-details">'
+        '<div class="br-item-card__item-details-title"><div class="br-item-card__item-details-title-section">'
+        '<span>صندوق صغير</span></div></div><div class="br-item-card__item-size">20 × 10 سم</div>'
+        '<div class="br-item-card__item-limit caption">حد الطلب 10 قطع</div></div></div>'
+        '<div class="br-item-card__item-pricing"><span class="body-medium">3.5 ج.م</span>'
+        '<span class="br-item-card__item-action-info-pack caption">10 قطعة</span></div></div>'
+        '<div class="br-item-card__item-action"><div class="br-item-card__icon-changer">'
+        '<button class="br-list-item__action"></button></div></div></div>'
+    )
+
+
+async def test_packaging_catalog_exposes_real_card_and_cart_only_controls_privately(surface):
+    session, service = surface
+    await session.page.goto("https://business.bosta.co/shop/packaging")
+    await session.page.set_content(_packaging_catalog())
+    await session.page.locator('.br-item-card__item-container').evaluate("""card => {
+      const flyer = card.cloneNode(true);
+      flyer.querySelector('.br-item-card__item-content').classList.remove('br-item-card__item-content-clickable');
+      flyer.querySelector('.br-item-card__item-details-title-section > span').textContent = 'فلاير 25x30';
+      card.after(flyer);
+    }""")
+    snapshot = await service._snapshot_payload(session)
+    catalog = snapshot["bosta_packaging"]["catalog"]
+    assert len(catalog) == 2
+    assert catalog[0]["name"] == "صندوق صغير" and catalog[0]["price_text"] == "3.5 ج.م"
+    assert catalog[0]["pack_unit"] == "10 قطعة" and catalog[0]["limit"] == "حد الطلب 10 قطع"
+    assert await session.page.locator(f'[data-operator-id="{catalog[0]["uid"]}"]').get_attribute("class") == "br-item-card__item-content br-item-card__item-content-clickable"
+    assert await session.page.locator(f'[data-operator-id="{catalog[0]["add_uid"]}"]').get_attribute("class") == "br-list-item__action"
+    assert catalog[1]["name"] == "فلاير 25x30" and catalog[1]["price_text"] == "3.5 ج.م"
+    assert "uid" not in catalog[1] and catalog[1]["add_uid"]
+    assert await session.page.locator(f'[data-operator-id="{catalog[1]["add_uid"]}"]').get_attribute("class") == "br-list-item__action"
+    await session.page.locator(f'[data-operator-id="{catalog[0]["add_uid"]}"]').focus()
+    focused = await service._snapshot_payload(session)
+    assert focused["active_element"]["uid"] == catalog[0]["add_uid"]
+    assert any(row["label"] == "صناديق" for row in snapshot["controls"])
+    assert snapshot["bosta_packaging"]["cart"]["shipping_text"] is None
+    assert snapshot["bosta_packaging"]["cart"]["final_total_text"] is None
+    assert KEY not in json.dumps(snapshot)
+    assert snapshot["privacy"] == "protected" and snapshot["screenshot_path"] is None
+    assert not session.trace_recording and not session.trace_path.exists()
+
+
+async def test_packaging_cart_reads_shipping_total_and_omits_checkout_and_ambiguous_quantity(surface):
+    session, service = surface
+    await session.page.goto("https://business.bosta.co/shop/packaging")
+    cart = (
+        '<div class="ant-drawer"><div role="dialog"><div class="ant-drawer-header">'
+        '<div class="ant-drawer-title">عربة التسوق</div><div class="ant-drawer-extra">'
+        '<span class="anticon anticon-close" role="img" aria-label="close" style="display:inline-block;width:12px;height:12px"></span>'
+        '</div></div>'
+        '<div class="ant-drawer-body"><div class="br-basket-item__container">'
+        '<div class="br-basket-item__description-section"><span>صندوق صغير</span></div>'
+        '<span class="br-basket-item__size">20 × 10 سم</span><span class="br-basket-item__limit">10 قطعة</span>'
+        '<span class="br-basket-item__action-price">3.5 ج.م</span>'
+        '<div class="br-basket-item__action-controller"><button class="button-disabled"></button>'
+        '<input class="ant-input-number-input" value="1"><button></button></div>'
+        '<button class="br-basket-item__action-delete"></button></div>'
+        '<div class="br-flyers-shop__cart-checkout__amount-cost">'
+        '<span class="br-flyers-shop__cart-checkout__amount-cost-currency">3.5 ج.م</span> +55 ج.م شحن</div>'
+        '<div class="br-flyers-shop__total_price-checkout-title">58.5 ج.م</div>'
+        '<button class="br-flyers-shop__checkout-button">تأكيدالأوردر</button></div></div></div>'
+    )
+    await session.page.set_content(_packaging_catalog() + cart)
+    snapshot = await service._snapshot_payload(session)
+    result = snapshot["bosta_packaging"]["cart"]
+    assert result["subtotal_text"] == "3.5 ج.م"
+    assert result["shipping_text"] == "+55 ج.م شحن" and result["final_total_text"] == "58.5 ج.م"
+    item = result["items"][0]
+    assert item["name"] == "صندوق صغير" and item["quantity"] == 1
+    controls = {row["uid"]: row for row in snapshot["controls"]}
+    closes = [row for row in controls.values() if row["label"] == "إغلاق السلة"]
+    assert len(closes) == 1 and closes[0]["role"] == "button" and closes[0]["tag"] == "span"
+    assert await session.page.locator(f'[data-operator-id="{closes[0]["uid"]}"]').get_attribute("aria-label") == "close"
+    assert controls[item["minus_uid"]]["disabled"] is True
+    assert controls[item["plus_uid"]]["disabled"] is False
+    assert item["remove_uid"] in controls
+    assert await session.page.locator('.br-flyers-shop__checkout-button').get_attribute('data-operator-id') is None
+    assert await session.page.locator('input.ant-input-number-input').get_attribute('data-operator-id') is None
+    assert KEY not in json.dumps(snapshot)
+    await session.page.locator('.br-flyers-shop__checkout-button').focus()
+    checkout = await service._snapshot_payload(session)
+    assert checkout["active_element"] == {"role": "button", "type": "button", "label": "Pay now"}
+    assert "uid" not in checkout["active_element"] and "element_id" not in checkout["active_element"]
+    await session.page.locator('input.ant-input-number-input').focus()
+    assert (await service._snapshot_payload(session))["active_element"] is None
+    await session.page.locator('.br-basket-item__action-controller').evaluate("el => el.append(document.createElement('button'))")
+    ambiguous = (await service._snapshot_payload(session))["bosta_packaging"]["cart"]["items"][0]
+    assert "plus_uid" not in ambiguous and "minus_uid" not in ambiguous
+
+
+async def test_packaging_projection_never_falls_back_to_body_on_other_routes_or_unknown_modals(surface):
+    session, service = surface
+    for url in (BOSTA_URL, 'https://business.bosta.co/signup', 'https://business.bosta.co/shop/packaging?token=hidden'):
+        await session.page.goto(url)
+        await session.page.set_content(_packaging_catalog())
+        snapshot = await service._snapshot_payload(session)
+        assert snapshot["bosta_packaging"] is None and snapshot["text"] == ""
+        assert KEY not in json.dumps(snapshot)
+    await session.page.goto('https://business.bosta.co/shop/packaging')
+    for extra in (f'<div role="dialog"><h2>Unknown</h2><input value="{KEY}"></div>',
+                  f'<input type="password" value="{KEY}">'):
+        await session.page.set_content(_packaging_catalog() + extra)
+        snapshot = await service._snapshot_payload(session)
+        assert snapshot["bosta_packaging"] is None and snapshot["text"] == ""
+        assert KEY not in json.dumps(snapshot)
