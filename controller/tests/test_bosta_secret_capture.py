@@ -208,3 +208,159 @@ async def test_other_sites_keep_normal_navigation_while_context_trace_stays_disc
     assert snapshot["text"] == "ordinary site text"
     assert "privacy" not in snapshot
     assert not session.trace_recording and not session.trace_path.exists()
+
+
+async def test_signup_address_fields_and_choices_keep_actual_url_without_values(surface):
+    session, service = surface
+    for path in ("/signup", "/settings/addresses"):
+        await session.page.goto("https://business.bosta.co" + path)
+        await session.page.set_content(
+            f'<label for="name">Full name</label><input id="name" value="{KEY}">'
+            f'<label for="password">Password</label><input id="password" type="password" value="{KEY}">'
+            f'<label for="otp">Verification code</label><input id="otp" value="{KEY}">'
+            '<label for="address">Address</label><input id="address">'
+            '<label for="city">City</label><select id="city"><option>Cairo</option><option>Giza</option></select>'
+            f'<input aria-label="API key" value="{KEY}"><p>{KEY}</p><button>Save address</button>'
+        )
+        snapshot = await service._snapshot_payload(session)
+        assert snapshot["url"] == "https://business.bosta.co" + path
+        controls = {item["label"]: item for item in snapshot["controls"]}
+        assert {"full name", "password", "verification code", "address", "city", "save address"} <= controls.keys()
+        assert controls["password"]["type"] == "password"
+        assert controls["city"]["options"] == ["Cairo", "Giza"]
+        assert all(re.fullmatch(r"op-[A-Za-z0-9]{4,40}", row["element_id"]) for row in controls.values())
+        assert KEY not in json.dumps(snapshot)
+        assert not session.trace_recording and not session.trace_path.exists()
+
+
+async def test_actual_key_form_metadata_and_arabic_readwrite_choice_are_visible(surface):
+    session, service = surface
+    await session.page.set_content(
+        '<label for="createEditKeyForm_name">اسم المفتاح</label><input id="createEditKeyForm_name">'
+        '<label for="createEditKeyForm_apiGroupName">الصلاحية</label>'
+        '<input id="createEditKeyForm_apiGroupName" role="combobox" type="search">'
+        '<div role="option">قراءة و كتابة</div><div role="option">Full</div>'
+        '<button>إنشاء</button><button>طلب رمز التحقق</button>'
+    )
+    snapshot = await service._snapshot_payload(session)
+    labels = {item["label"] for item in snapshot["controls"]}
+    assert {"key name", "permission", "قراءة و كتابة", "إنشاء", "طلب رمز التحقق"} <= labels
+    assert "full" not in labels
+
+
+async def test_creation_preflight_refuses_full_scope_without_reading_key(surface):
+    session, service = surface
+    for choice, expected in (("Full", "scope_required"), ("قراءة و كتابة", "ready")):
+        await session.page.set_content('<div role="dialog"><input id="createEditKeyForm_name"><div class="ant-select">'
+            f'<span class="ant-select-selection-item">{choice}</span>'
+            '<input id="createEditKeyForm_apiGroupName" role="combobox" type="search"></div><button>إنشاء</button></div>'
+            f'<input aria-label="API key" value="{KEY}">')
+        snapshot = await service._snapshot_payload(session)
+        assert snapshot["bosta_key_creation"]["scope"] == ("full" if choice == "Full" else "read_write")
+        assert len(snapshot["bosta_key_creation"]["confirm_uids"]) == 1
+        result = await service.find_api_keys("s", "bosta", prepare_only=True)
+        assert result["status"] == expected and result["keys"] == []
+        assert KEY not in json.dumps(result)
+
+
+@pytest.mark.parametrize("invalid", [False, True], ids=["observed-dialog", "extra-field"])
+async def test_one_time_dialog_capture_has_exact_structural_provenance(surface, invalid):
+    session, service = surface
+    await session.page.set_content(
+        '<div role="dialog"><button class="ant-modal-close"></button>'
+        f'<input type="text" value="{KEY}"><button>نسخ</button><button>تم</button>'
+        + ('<input type="text">' if invalid else '') + '</div>'
+    )
+    prepared = await service.find_api_keys("s", "bosta", prepare_only=True)
+    assert prepared["status"] == ("scope_required" if invalid else "ready") and prepared["keys"] == []
+    result = await service.find_api_keys("s", "bosta")
+    if invalid:
+        assert result["keys"] == []
+    else:
+        assert result["keys"] == [KEY] and result["source"] == "bosta_one_time_key_dialog"
+    assert KEY not in json.dumps(await service._snapshot_payload(session))
+
+
+async def test_unknown_visible_api_modal_is_unverified_without_secret_payload(surface):
+    session, service = surface
+    await session.page.set_content(
+        '<input id="createEditKeyForm_apiGroupName" type="hidden">'
+        f'<div role="dialog"><label for="otp">Verification code</label><input id="otp" value="{KEY}">'
+        f'<p>{KEY}</p><button>Verify</button></div>'
+    )
+    snapshot = await service._snapshot_payload(session)
+    assert snapshot["bosta_key_creation"] == {"state": "unverified", "scope": None, "confirm_uids": []}
+    prepared = await service.find_api_keys("s", "bosta", prepare_only=True)
+    assert prepared["status"] == "scope_required" and prepared["keys"] == []
+    assert KEY not in json.dumps(snapshot) + json.dumps(prepared)
+
+
+async def test_observed_arabic_onboarding_labels_keep_uids_without_input_values(surface):
+    session, service = surface
+    await session.page.goto("https://business.bosta.co/settings/addresses")
+    fields = [
+        ("اسم العنوان", "address name"), ("العنوان بالتفصيل *", "address"),
+        ("اسم/رقم المبنى\nاختياري", "building number"), ("رقم الدور\nاختياري", "floor"),
+        ("رقم الشقة\nاختياري", "apartment"), ("علامة مميزة\nاختياري", "landmark"),
+        ("الاسم بالكامل", "full name"), ("رقم التليفون", "phone"),
+        ("اسم شركتك", "company name"), ("رابط الشركة", "website"),
+    ]
+    buttons = ["إضافة مكان جديد", "إضافة موقع الاستلام", "إنشاء عنوان جديد", "تعديل المكان",
+               "تحديد الموقع", "المحافظة والمنطقة", "ابدأ شحن الان!", "طلب OTP"]
+    html = ''
+    for i, (label, _) in enumerate(fields):
+        field_id = f"createEditBusinessLocationForm_address_field{i}"
+        # The provider renders the optional decoration in its own visual line;
+        # textContent concatenates it directly to the field label.
+        rendered_label = label.replace('\nاختياري', '<span style="display:block">اختياري</span>')
+        html += f'<div class="ant-form-item"><label for="{field_id}">{rendered_label}</label>'
+        html += f'<input id="{field_id}" value="{KEY}"></div>'
+    html += ''.join(f'<button>{label}</button>' for label in buttons)
+    html += (f'<label><input type="radio" name="volume" value="{KEY}" checked>أقل من 100 شحنة</label>'
+             f'<label><input type="radio" name="service" value="{KEY}">الشحن فقط</label>'
+             '<label for="country">Country</label><select id="country"><option>مصر</option></select>'
+             '<div class="ant-form-item"><label>المحافظة والمنطقة</label>'
+             f'<button id="createEditBusinessLocationForm_address_districtId">{KEY}</button></div>'
+             f'<input aria-label="API key" value="{KEY}"><button>{KEY}</button>')
+    await session.page.set_content(html)
+    snapshot = await service._snapshot_payload(session)
+    controls = {item["label"]: item for item in snapshot["controls"]}
+    assert {canonical for _, canonical in fields} <= controls.keys()
+    assert {label.lower() for label in buttons} <= controls.keys()
+    assert controls["أقل من 100 شحنة"]["role"] == "radio"
+    assert controls["أقل من 100 شحنة"]["checked"] is True
+    assert controls["الشحن فقط"]["role"] == "radio"
+    assert controls["country"]["options"] == ["مصر"]
+    assert controls["المحافظة والمنطقة"]["tag"] == "button"
+    assert all(re.fullmatch(r"op-[A-Za-z0-9]{4,40}", item["element_id"]) for item in controls.values())
+    assert KEY not in json.dumps(snapshot)
+
+
+async def test_observed_region_dialog_projects_component_choices_and_disabled_districts(surface):
+    session, service = surface
+    await session.page.goto("https://business.bosta.co/settings/addresses")
+    region = (
+        '<div role="dialog"><h2 class="ant-modal-title">اختار المنطقة</h2>'
+        f'<input type="text" placeholder="اكتب منطقتك “مدينة نصر”" value="{KEY}">'
+        '<div role="list"><div class="br-cities-collapse__item-header"><span>القاهرة</span></div>'
+        '<div class="br-cities-collapse__district-items-container"><div role="list">'
+        '<div class="br-cities-collapse__district-item"><span>مدينة نصر</span></div>'
+        '<div class="br-cities-collapse__district-item br-cities-collapse__district-item-disabled">'
+        '<span>منطقة بعيدة</span><div class="br-cities-collapse__district-item-tags">خارج التغطية</div></div>'
+        '</div></div></div></div>'
+    )
+    await session.page.set_content(region + f'<div class="br-cities-collapse__district-item"><span>{KEY}</span></div>')
+    snapshot = await service._snapshot_payload(session)
+    controls = {item["label"]: item for item in snapshot["controls"]}
+    assert controls["ابحث عن المنطقة"]["role"] == "textbox"
+    assert controls["القاهرة"]["role"] == "button"
+    assert controls["مدينة نصر"]["role"] == "option" and controls["مدينة نصر"]["disabled"] is False
+    assert controls["منطقة بعيدة"]["role"] == "option" and controls["منطقة بعيدة"]["disabled"] is True
+    assert not any("خارج التغطية" in label for label in controls)
+    assert KEY not in json.dumps(snapshot)
+    for url, html in (("https://business.bosta.co/settings/addresses", region.replace("اختار المنطقة", "Other modal")),
+                      (BOSTA_URL, region)):
+        await session.page.goto(url)
+        await session.page.set_content(html)
+        labels = {item["label"] for item in (await service._snapshot_payload(session))["controls"]}
+        assert "القاهرة" not in labels and "مدينة نصر" not in labels and "منطقة بعيدة" not in labels
