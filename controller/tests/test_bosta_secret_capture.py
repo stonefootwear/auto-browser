@@ -293,3 +293,74 @@ async def test_unknown_visible_api_modal_is_unverified_without_secret_payload(su
     prepared = await service.find_api_keys("s", "bosta", prepare_only=True)
     assert prepared["status"] == "scope_required" and prepared["keys"] == []
     assert KEY not in json.dumps(snapshot) + json.dumps(prepared)
+
+
+async def test_observed_arabic_onboarding_labels_keep_uids_without_input_values(surface):
+    session, service = surface
+    await session.page.goto("https://business.bosta.co/settings/addresses")
+    fields = [
+        ("اسم العنوان", "address name"), ("العنوان بالتفصيل *", "address"),
+        ("اسم/رقم المبنى\nاختياري", "building number"), ("رقم الدور\nاختياري", "floor"),
+        ("رقم الشقة\nاختياري", "apartment"), ("علامة مميزة\nاختياري", "landmark"),
+        ("الاسم بالكامل", "full name"), ("رقم التليفون", "phone"),
+        ("اسم شركتك", "company name"), ("رابط الشركة", "website"),
+    ]
+    buttons = ["إضافة مكان جديد", "إضافة موقع الاستلام", "إنشاء عنوان جديد", "تعديل المكان",
+               "تحديد الموقع", "المحافظة والمنطقة", "ابدأ شحن الان!", "طلب OTP"]
+    html = ''
+    for i, (label, _) in enumerate(fields):
+        field_id = f"createEditBusinessLocationForm_address_field{i}"
+        # The provider renders the optional decoration in its own visual line;
+        # textContent concatenates it directly to the field label.
+        rendered_label = label.replace('\nاختياري', '<span style="display:block">اختياري</span>')
+        html += f'<div class="ant-form-item"><label for="{field_id}">{rendered_label}</label>'
+        html += f'<input id="{field_id}" value="{KEY}"></div>'
+    html += ''.join(f'<button>{label}</button>' for label in buttons)
+    html += (f'<label><input type="radio" name="volume" value="{KEY}" checked>أقل من 100 شحنة</label>'
+             f'<label><input type="radio" name="service" value="{KEY}">الشحن فقط</label>'
+             '<label for="country">Country</label><select id="country"><option>مصر</option></select>'
+             '<div class="ant-form-item"><label>المحافظة والمنطقة</label>'
+             f'<button id="createEditBusinessLocationForm_address_districtId">{KEY}</button></div>'
+             f'<input aria-label="API key" value="{KEY}"><button>{KEY}</button>')
+    await session.page.set_content(html)
+    snapshot = await service._snapshot_payload(session)
+    controls = {item["label"]: item for item in snapshot["controls"]}
+    assert {canonical for _, canonical in fields} <= controls.keys()
+    assert {label.lower() for label in buttons} <= controls.keys()
+    assert controls["أقل من 100 شحنة"]["role"] == "radio"
+    assert controls["أقل من 100 شحنة"]["checked"] is True
+    assert controls["الشحن فقط"]["role"] == "radio"
+    assert controls["country"]["options"] == ["مصر"]
+    assert controls["المحافظة والمنطقة"]["tag"] == "button"
+    assert all(re.fullmatch(r"op-[A-Za-z0-9]{4,40}", item["element_id"]) for item in controls.values())
+    assert KEY not in json.dumps(snapshot)
+
+
+async def test_observed_region_dialog_projects_component_choices_and_disabled_districts(surface):
+    session, service = surface
+    await session.page.goto("https://business.bosta.co/settings/addresses")
+    region = (
+        '<div role="dialog"><h2 class="ant-modal-title">اختار المنطقة</h2>'
+        f'<input type="text" placeholder="اكتب منطقتك “مدينة نصر”" value="{KEY}">'
+        '<div role="list"><div class="br-cities-collapse__item-header"><span>القاهرة</span></div>'
+        '<div class="br-cities-collapse__district-items-container"><div role="list">'
+        '<div class="br-cities-collapse__district-item"><span>مدينة نصر</span></div>'
+        '<div class="br-cities-collapse__district-item br-cities-collapse__district-item-disabled">'
+        '<span>منطقة بعيدة</span><div class="br-cities-collapse__district-item-tags">خارج التغطية</div></div>'
+        '</div></div></div></div>'
+    )
+    await session.page.set_content(region + f'<div class="br-cities-collapse__district-item"><span>{KEY}</span></div>')
+    snapshot = await service._snapshot_payload(session)
+    controls = {item["label"]: item for item in snapshot["controls"]}
+    assert controls["ابحث عن المنطقة"]["role"] == "textbox"
+    assert controls["القاهرة"]["role"] == "button"
+    assert controls["مدينة نصر"]["role"] == "option" and controls["مدينة نصر"]["disabled"] is False
+    assert controls["منطقة بعيدة"]["role"] == "option" and controls["منطقة بعيدة"]["disabled"] is True
+    assert not any("خارج التغطية" in label for label in controls)
+    assert KEY not in json.dumps(snapshot)
+    for url, html in (("https://business.bosta.co/settings/addresses", region.replace("اختار المنطقة", "Other modal")),
+                      (BOSTA_URL, region)):
+        await session.page.goto(url)
+        await session.page.set_content(html)
+        labels = {item["label"] for item in (await service._snapshot_payload(session))["controls"]}
+        assert "القاهرة" not in labels and "مدينة نصر" not in labels and "منطقة بعيدة" not in labels

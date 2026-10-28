@@ -98,7 +98,7 @@ async def protect_secret_page(session: Any, *, destination: str = "") -> bool:
 # Return only a closed vocabulary of labels, never arbitrary DOM text/values.
 SAFE_CONTROLS_SCRIPT = r"""() => {
   const apiPage = location.pathname === '/settings/api-integration';
-  const allowed = /^(?:api integration|api key|api keys|show|show api key|reveal|reveal api key|copy|copy api key|create|generate|create api key|generate api key|generate new api key|readwrite|read write|read only|readonly|request otp|send otp|resend otp|verify|settings|integrations|close|cancel|confirm|continue|login|log in|sign in|sign up|signup|register|next|back|save|save address|add address|create new address|add pickup location|create account|business information|pickup locations|addresses|submit|إنشاء حساب|تسجيل الدخول|التالي|السابق|حفظ|تأكيد|إلغاء|إضافة عنوان|نسخ|تم|قراءة و كتابة|إنشاء|انشاء|متابعة|تحقق|إعدادات|عنوان جديد|إرسال رمز التحقق|طلب رمز التحقق)$/i;
+  const allowed = /^(?:api integration|api key|api keys|show|show api key|reveal|reveal api key|copy|copy api key|create|generate|create api key|generate api key|generate new api key|readwrite|read write|read only|readonly|request otp|send otp|resend otp|verify|settings|integrations|close|cancel|confirm|continue|login|log in|sign in|sign up|signup|register|next|back|save|save address|add address|create new address|add pickup location|create account|business information|pickup locations|addresses|submit|إنشاء حساب|تسجيل الدخول|التالي|السابق|حفظ|تأكيد|إلغاء|إضافة عنوان|نسخ|تم|قراءة و كتابة|إنشاء|انشاء|متابعة|تحقق|إعدادات|عنوان جديد|إرسال رمز التحقق|طلب رمز التحقق|طلب OTP|إضافة مكان جديد|إضافة موقع الاستلام|إنشاء عنوان جديد|تعديل المكان|تحديد الموقع|المحافظة والمنطقة|أقل من 100 شحنة|الشحن فقط|ابدأ شحن الان!|مصر)$/i;
   const fields = new Map([
     ['full name','Full name'], ['fullname','Full name'], ['name','Name'],
     ['first name','First name'], ['firstname','First name'], ['last name','Last name'], ['lastname','Last name'],
@@ -116,15 +116,19 @@ SAFE_CONTROLS_SCRIPT = r"""() => {
     ['الاسم','Name'], ['الاسم بالكامل','Full name'], ['اسم الشركة','Company name'], ['البريد الإلكتروني','Email'],
     ['رقم الهاتف','Phone'], ['العنوان','Address'], ['المحافظة','Governorate'], ['المدينة','City'], ['المنطقة','Area'],
     ['اسم النشاط التجاري','Business name'], ['نوع النشاط التجاري','Business type'], ['اسم المتجر','Business name'],
+    ['اسم شركتك','Company name'], ['رابط الشركة','Website'], ['اسم العنوان','Address name'],
     ['رقم الموبايل','Phone'], ['رقم التليفون','Phone'], ['الموقع الإلكتروني','Website'],
     ['العنوان بالتفصيل','Address'], ['رقم المبنى','Building number'], ['الشارع','Street'], ['اسم الشارع','Street'],
+    ['اسم/رقم المبنى','Building number'], ['رقم الدور','Floor'], ['رقم الشقة','Apartment'],
     ['الدور','Floor'], ['الشقة','Apartment'], ['علامة مميزة','Landmark'],
+    ['أقل من 100 شحنة','أقل من 100 شحنة'], ['الشحن فقط','الشحن فقط'], ['مصر','مصر'],
     ['كلمة المرور','Password'], ['كود التحقق','Verification code'], ['رمز التحقق','Verification code']
   ]);
   const visible = el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden'
     && !el.closest('[aria-hidden="true"]');
   const normalize = text => (text || '').replace(/([a-z])([A-Z])/g, '$1 $2')
-    .replace(/[_:*]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    .replace(/[_:*]/g, ' ').replace(/اختياري\s*$/g, ' ')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
   const labelFor = el => {
     const labelled = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
       .map(id => document.getElementById(id)?.textContent || '').join(' ');
@@ -135,13 +139,31 @@ SAFE_CONTROLS_SCRIPT = r"""() => {
   };
   const optionText = node => (node.textContent || '').replace(/\s+/g, ' ').trim();
   const safeOption = text => text.length > 0 && text.length <= 100 && /^[\p{L}\p{N} .,'()\/-]+$/u.test(text);
-  const selector = 'button,a,input,textarea,select,[role="button"],[role="combobox"],[role="radio"],[role="checkbox"],[role="option"],.ant-select-item-option';
-  return [...document.querySelectorAll(selector)].flatMap(el => {
+  const regionDialogs = apiPage ? [] : [...document.querySelectorAll('[role="dialog"],dialog[open],[aria-modal="true"]')]
+    .filter(dialog => visible(dialog) && (
+      dialog.querySelector('.ant-modal-title,[role="heading"],h1,h2,h3,h4,h5,h6')?.textContent ||
+      (dialog.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+        .map(id => document.getElementById(id)?.textContent || '').join(' ')
+    ).replace(/\s+/g, ' ').trim() === 'اختار المنطقة');
+  const regionDialog = regionDialogs.length === 1 ? regionDialogs[0] : null;
+  const selector = 'button,a,input,textarea,select,[role="button"],[role="combobox"],[role="radio"],[role="checkbox"],[role="option"],.ant-select-item-option,.br-cities-collapse__item-header,.br-cities-collapse__district-item';
+  return [...(regionDialog || document).querySelectorAll(selector)].flatMap(el => {
     if (!visible(el)) return [];
+    const regionHeader = !!regionDialog && el.matches('.br-cities-collapse__item-header') && !!el.closest('[role="list"]');
+    const regionLeaf = !!regionDialog && el.matches('.br-cities-collapse__district-items-container [role="list"] > div.br-cities-collapse__district-item')
+      && el.firstElementChild?.tagName === 'SPAN';
+    const regionSearch = !!regionDialog && el.matches('input[type="text"]')
+      && /^اكتب منطقتك\s+["“«]مدينة نصر["”»]$/.test((el.getAttribute('placeholder') || '').trim());
+    const districtButton = !apiPage && el.tagName === 'BUTTON'
+      && el.id === 'createEditBusinessLocationForm_address_districtId'
+      && normalize(el.closest('.ant-form-item')?.querySelector('label')?.textContent) === 'المحافظة والمنطقة';
     const field = el.matches('input,textarea,select,[role="combobox"]');
-    const option = el.matches('[role="option"],.ant-select-item-option');
-    let label = field ? labelFor(el) : (el.getAttribute('aria-label') || el.innerText || '').trim();
-    if (option && !apiPage) {
+    const option = regionLeaf || el.matches('[role="option"],.ant-select-item-option');
+    let label = districtButton ? 'المحافظة والمنطقة' : regionSearch ? 'ابحث عن المنطقة'
+      : regionLeaf ? optionText(el.firstElementChild) : regionHeader ? optionText(el)
+      : field ? labelFor(el) : (el.getAttribute('aria-label') || el.innerText || '').trim();
+    if ((regionHeader || regionLeaf) && !safeOption(label)) return [];
+    if (option && !apiPage && !regionLeaf) {
       // Only expose choices belonging to an already named non-secret combobox.
       const box = el.closest('[role="listbox"],.ant-select-dropdown');
       const owned = box && [...document.querySelectorAll('[role="combobox"],select')].some(control =>
@@ -153,7 +175,7 @@ SAFE_CONTROLS_SCRIPT = r"""() => {
       // Unknown and credential fields have no public surface. The owner's secure
       // handoff sees only a fixed password/code label, never any entered value.
       if (!label || (apiPage && !['Key name','Permission','Password','Verification code'].includes(label))) return [];
-    } else if (!(option && !apiPage) && !allowed.test(label)) return [];
+    } else if (!regionHeader && !(option && !apiPage) && !allowed.test(label)) return [];
     const link = el.tagName === 'A';
     let href = '';
     if (link) {
@@ -169,10 +191,12 @@ SAFE_CONTROLS_SCRIPT = r"""() => {
     return [{element_id: el.dataset.operatorId, uid: el.dataset.operatorId,
       selector_hint: '[data-operator-id="' + el.dataset.operatorId + '"]',
       tag: el.tagName.toLowerCase(), label: label.toLowerCase(),
-      role: link ? 'link' : (option ? 'option' : el.getAttribute('role') || (field ? (el.tagName === 'SELECT' ? 'combobox' : 'textbox') : 'button')),
+      role: link ? 'link' : (option ? 'option' : el.getAttribute('role') || (field ? (el.tagName === 'SELECT' ? 'combobox' : ['radio','checkbox'].includes(el.type) ? el.type : 'textbox') : 'button')),
       type: field ? (label === 'Password' ? 'password' : el.type || 'text') : (link ? '' : (['button','submit','reset'].includes(el.type) ? el.type : 'button')),
+      checked: ['radio','checkbox'].includes(el.type) ? el.checked === true : null,
       options: el.tagName === 'SELECT' ? [...el.options].map(optionText).filter(safeOption) : [],
-      href, visible: true, disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true'}];
+      href, visible: true, disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true'
+        || (regionLeaf && el.classList.contains('br-cities-collapse__district-item-disabled'))}];
   }).slice(0, 50);
 }"""
 
